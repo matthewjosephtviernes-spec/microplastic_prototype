@@ -1,7 +1,7 @@
 # Redesigned Streamlit app for Microplastic Risk Prediction
 # - Cleaner structure, robust preprocessing, safer modeling fallbacks
-# - Improved visuals: aggregated category bars, rotated/annotated labels, cap pairplots
-# - Professional look via simple CSS and clearer sidebar steps
+# - Improved visuals: aggregated category bars, per-class metric plots, ROC/PR curves for binary
+# - Sidebar reorganized as expanders to separate steps and make options discoverable
 
 import io
 import re
@@ -23,7 +23,8 @@ from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
     r2_score, mean_absolute_error, mean_squared_error,
-    confusion_matrix, classification_report
+    confusion_matrix, classification_report, roc_auc_score, roc_curve,
+    precision_recall_curve
 )
 from sklearn.metrics import silhouette_score
 
@@ -43,7 +44,7 @@ st.markdown(
 )
 
 st.markdown('<div class="big-header">Microplastic Risk Prediction System</div>', unsafe_allow_html=True)
-st.write("A robust, professional Streamlit app for exploring microplastic datasets, preprocessing, modeling, and visualizations.")
+st.write("A robust Streamlit app for exploring microplastic datasets, preprocessing, modeling, and visualizations.")
 
 # -------------------------
 # Helpers
@@ -216,87 +217,80 @@ def has_nan_or_inf(arr) -> bool:
     return np.isnan(arr).any() or np.isinf(arr).any()
 
 # -------------------------
-# Sidebar: upload & preprocessing
+# Sidebar: structured into expanders for clarity
 # -------------------------
-st.sidebar.header("1) Dataset")
-uploaded_file = st.sidebar.file_uploader("Upload CSV or Excel (e.g., Data1_Microplastic.csv)", type=["csv", "xls", "xlsx"])
-if not uploaded_file:
+with st.sidebar.expander("1) Dataset & Preview", expanded=True):
+    st.write("Upload and inspect your dataset. Column names will be cleaned automatically.")
+    uploaded_file = st.file_uploader("Upload CSV or Excel (e.g., Data1_Microplastic.csv)", type=["csv", "xls", "xlsx"] )
+    if uploaded_file:
+        st.caption(f"File: {uploaded_file.name}")
+
+# stop early if missing file
+if 'uploaded_file' not in locals() or uploaded_file is None:
     st.info("Please upload your dataset file to proceed.")
     st.stop()
 
+# read file
 df_raw = safe_read_file(uploaded_file)
 if df_raw is None:
     st.stop()
 
-st.sidebar.markdown(f"**File:** {uploaded_file.name} — rows: {df_raw.shape[0]} cols: {df_raw.shape[1]}")
+st.sidebar.success(f"Loaded: {uploaded_file.name} — rows: {df_raw.shape[0]} cols: {df_raw.shape[1]}")
+
+# Clean names and preview
 df_raw = clean_column_names(df_raw)
-st.subheader("Data preview (first 50 rows)")
-st.dataframe(df_raw.head(50))
+with st.expander("Data preview (first 50 rows)", expanded=True):
+    st.dataframe(df_raw.head(50))
 
 # Parse MP count candidate
 mp_count_candidates = [c for c in df_raw.columns if "mp_count" in c.lower() or "count" in c.lower() or "items" in c.lower()]
 mp_count_col = None
-if mp_count_candidates:
-    mp_count_col = st.sidebar.selectbox("Column to parse as numeric MP count (optional)", [""] + mp_count_candidates)
-else:
-    mp_count_col = st.sidebar.selectbox("Column to parse as numeric MP count (optional)", [""] + df_raw.columns.tolist())
-if mp_count_col:
-    df_raw["_MP_Count_parsed"] = df_raw[mp_count_col].apply(parse_mp_count)
-    st.write(f"Parsed MP count saved to '_MP_Count_parsed' — non-null: {df_raw['_MP_Count_parsed'].notna().sum()}")
+with st.sidebar.expander("MP Count parsing options", expanded=False):
+    if mp_count_candidates:
+        mp_count_col = st.selectbox("Column to parse as numeric MP count (optional)", [""] + mp_count_candidates)
+    else:
+        mp_count_col = st.selectbox("Column to parse as numeric MP count (optional)", [""] + df_raw.columns.tolist())
+    if mp_count_col:
+        df_raw["_MP_Count_parsed"] = df_raw[mp_count_col].apply(parse_mp_count)
+        st.sidebar.write(f"Parsed MP count saved to '_MP_Count_parsed' — non-null: {df_raw['_MP_Count_parsed'].notna().sum()}")
 
 # -------------------------
-# Preprocessing controls (refactored for clarity)
+# Preprocessing controls (grouped)
 # -------------------------
-st.sidebar.header("2) Preprocessing")
-st.sidebar.write("Choose how to handle missing values and imputation.")
+with st.sidebar.expander("2) Preprocessing", expanded=False):
+    st.write("Choose how to handle missing values and imputation.")
+    drop_na = st.checkbox("Drop rows with any missing values", value=False)
+    impute_strategy = st.selectbox("Numeric imputation strategy", ["mean", "median", "most_frequent"], index=0)
 
-# Option to drop rows with any missing values
-drop_na = st.sidebar.checkbox("Drop rows with any missing values", value=False)
-# Strategy for numeric imputation when not dropping rows
-impute_strategy = st.sidebar.selectbox("Numeric imputation strategy", ["mean", "median", "most_frequent"], index=0)
-
-def impute_numeric_columns(df_in: pd.DataFrame, strategy: str) -> pd.DataFrame:
-    """Impute numeric columns using SimpleImputer and the chosen strategy.
-    Returns a new DataFrame with numeric columns imputed.
-    """
-    df_out = df_in.copy()
-    numeric_cols = df_out.select_dtypes(include=[np.number]).columns.tolist()
-    if not numeric_cols:
+    def impute_numeric_columns(df_in: pd.DataFrame, strategy: str) -> pd.DataFrame:
+        df_out = df_in.copy()
+        numeric_cols = df_out.select_dtypes(include=[np.number]).columns.tolist()
+        if not numeric_cols:
+            return df_out
+        imputer = SimpleImputer(strategy=strategy)
+        df_out[numeric_cols] = imputer.fit_transform(df_out[numeric_cols])
         return df_out
-    imputer = SimpleImputer(strategy=strategy)
-    df_out[numeric_cols] = imputer.fit_transform(df_out[numeric_cols])
-    return df_out
 
-def impute_categorical_columns(df_in: pd.DataFrame) -> pd.DataFrame:
-    """Fill missing values in object/category columns with their mode (most frequent value).
-    If a column has no clear mode, fill with an empty string.
-    """
-    df_out = df_in.copy()
-    cat_cols = df_out.select_dtypes(include=["object", "category"]).columns.tolist()
-    for col in cat_cols:
-        if df_out[col].isna().any():
-            mode_series = df_out[col].mode()
-            fill_value = mode_series.iloc[0] if not mode_series.empty else ""
-            df_out[col] = df_out[col].fillna(fill_value)
-    return df_out
+    def impute_categorical_columns(df_in: pd.DataFrame) -> pd.DataFrame:
+        df_out = df_in.copy()
+        cat_cols = df_out.select_dtypes(include=["object", "category"]).columns.tolist()
+        for col in cat_cols:
+            if df_out[col].isna().any():
+                mode_series = df_out[col].mode()
+                fill_value = mode_series.iloc[0] if not mode_series.empty else ""
+                df_out[col] = df_out[col].fillna(fill_value)
+        return df_out
 
-# Apply the chosen preprocessing path with clear steps and messages
+# Apply preprocessing
 if drop_na:
     before_rows = df_raw.shape[0]
     df = df_raw.dropna(axis=0, how="any").reset_index(drop=True)
     after_rows = df.shape[0]
     st.info(f"Dropped rows with missing values: {before_rows} -> {after_rows}")
 else:
-    # Work on a copy to avoid changing the original preview dataframe
     df = df_raw.copy().reset_index(drop=True)
-
-    # 1) Impute numeric columns using chosen strategy
     df = impute_numeric_columns(df, impute_strategy)
-
-    # 2) Impute categorical columns using mode
     df = impute_categorical_columns(df)
-
-    # 3) Report how many missing values remain, per column
     remaining_na = df.isna().sum()
     total_remaining = int(remaining_na.sum())
     if total_remaining == 0:
@@ -311,21 +305,24 @@ st.write(f"Dataset shape after cleaning: {df.shape}")
 # -------------------------
 # Modeling selection
 # -------------------------
-st.sidebar.header("3) Modeling & Features")
-task = st.sidebar.selectbox("Task", ("classification", "regression", "clustering"))
+with st.sidebar.expander("3) Modeling & Features", expanded=True):
+    task = st.selectbox("Task", ("classification", "regression", "clustering"))
 
-target_col = ""
-if task != "clustering":
-    target_col = st.sidebar.selectbox("Target column (for supervised tasks)", [""] + df.columns.tolist())
-    if target_col == "" or target_col is None:
-        st.sidebar.warning("Please select a target column for supervised tasks.")
-        st.stop()
+    target_col = ""
+    if task != "clustering":
+        target_col = st.selectbox("Target column (for supervised tasks)", [""] + df.columns.tolist())
+        if target_col == "" or target_col is None:
+            st.warning("Please select a target column for supervised tasks.")
 
-all_cols = df.columns.tolist()
-default_features = [c for c in all_cols if c != target_col]
-selected_features = st.sidebar.multiselect("Select feature columns (at least one)", all_cols, default=default_features)
+    all_cols = df.columns.tolist()
+    default_features = [c for c in all_cols if c != target_col]
+    selected_features = st.multiselect("Select feature columns (at least one)", all_cols, default=default_features)
+
+# Validate feature/target
+if task != "clustering" and (target_col == "" or target_col is None):
+    st.stop()
 if not selected_features:
-    st.sidebar.error("Select at least one feature column.")
+    st.error("Select at least one feature column.")
     st.stop()
 
 X, y, label_enc = prepare_features(df, selected_features, target_col if target_col else None, task, impute_strategy=impute_strategy)
@@ -335,10 +332,10 @@ if X.shape[1] == 0:
     st.error("No usable features after preprocessing. Please revise your feature selection.")
     st.stop()
 
-# Train/test split options
-st.sidebar.header("4) Train/Test split")
-test_size = st.sidebar.slider("Test size", 0.05, 0.5, 0.2, 0.05)
-random_state = int(st.sidebar.number_input("Random state", value=42, step=1))
+# Train/test split options grouped
+with st.sidebar.expander("4) Train/Test split & Randomness", expanded=False):
+    test_size = st.slider("Test size", 0.05, 0.5, 0.2, 0.05)
+    random_state = int(st.number_input("Random state", value=42, step=1))
 
 if task in ("classification", "regression"):
     if y is None or len(y) == 0:
@@ -350,26 +347,131 @@ else:
     X_train = X_test = y_train = y_test = None
 
 # -------------------------
-# Modeling & evaluation
+# Modeling & evaluation (with improved reporting)
 # -------------------------
 st.header("Model training & evaluation")
+
+# Utility for pretty classification report and visualizations
+def display_classification_results(model, X_test, y_test, label_enc=None, model_name: str = "Model"):
+    try:
+        y_pred = model.predict(X_test)
+    except Exception as e:
+        st.error(f"Prediction failed: {e}")
+        return
+
+    # Confusion matrix (normalized and counts)
+    cm = confusion_matrix(y_test, y_pred)
+    cm_norm = confusion_matrix(y_test, y_pred, normalize='true')
+
+    st.subheader(f"{model_name} — Performance")
+    st.write(f"Accuracy: {accuracy_score(y_test, y_pred):.3f}")
+
+    # Classification report as dataframe
+    cr = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
+    cr_df = pd.DataFrame(cr).transpose()
+    st.dataframe(cr_df.style.format({c: "{:.3f}" for c in cr_df.select_dtypes(include=[float]).columns}))
+
+    # Plot per-class metrics (precision, recall, f1)
+    metrics_df = cr_df.loc[[c for c in cr_df.index if c not in ("accuracy", "macro avg", "weighted avg")], ["precision", "recall", "f1-score"]]
+    if not metrics_df.empty:
+        fig, ax = plt.subplots(figsize=(8, max(3, 0.4 * metrics_df.shape[0])))
+        metrics_df.plot(kind='barh', ax=ax)
+        ax.set_title(f"Per-class metrics — {model_name}")
+        ax.legend(loc='lower right')
+        st.pyplot(fig)
+
+    # Confusion matrix heatmap
+    fig2, ax2 = plt.subplots(figsize=(6, 5))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax2)
+    ax2.set_title(f"Confusion Matrix (counts) — {model_name}")
+    ax2.set_xlabel('Predicted')
+    ax2.set_ylabel('Actual')
+    st.pyplot(fig2)
+
+    fig3, ax3 = plt.subplots(figsize=(6, 5))
+    sns.heatmap(cm_norm, annot=True, fmt='.2f', cmap='viridis', ax=ax3)
+    ax3.set_title(f"Confusion Matrix (normalized by true class) — {model_name}")
+    ax3.set_xlabel('Predicted')
+    ax3.set_ylabel('Actual')
+    st.pyplot(fig3)
+
+    # ROC / PR curves for binary classification
+    if len(np.unique(y_test)) == 2:
+        try:
+            if hasattr(model, "predict_proba"):
+                probs = model.predict_proba(X_test)[:, 1]
+            elif hasattr(model, "decision_function"):
+                probs = model.decision_function(X_test)
+            else:
+                probs = None
+
+            if probs is not None:
+                fpr, tpr, _ = roc_curve(y_test, probs)
+                auc_score = roc_auc_score(y_test, probs)
+                fig4, ax4 = plt.subplots(figsize=(6, 5))
+                ax4.plot(fpr, tpr, label=f"ROC AUC = {auc_score:.3f}")
+                ax4.plot([0, 1], [0, 1], 'k--', alpha=0.5)
+                ax4.set_xlabel('FPR')
+                ax4.set_ylabel('TPR')
+                ax4.set_title('ROC Curve')
+                ax4.legend()
+                st.pyplot(fig4)
+
+                precision, recall, _ = precision_recall_curve(y_test, probs)
+                pr_auc = np.trapz(recall, precision)
+                fig5, ax5 = plt.subplots(figsize=(6, 5))
+                ax5.plot(precision, recall, label=f"PR AUC = {pr_auc:.3f}")
+                ax5.set_xlabel('Precision')
+                ax5.set_ylabel('Recall')
+                ax5.set_title('Precision-Recall Curve')
+                ax5.legend()
+                st.pyplot(fig5)
+        except Exception as e:
+            st.warning(f"Could not calculate ROC/PR curves: {e}")
+
+    # Feature importance or coefficients
+    try:
+        if hasattr(model, 'feature_importances_'):
+            fi = pd.Series(model.feature_importances_, index=X_test.columns).sort_values(ascending=False).head(20)
+            fig6, ax6 = plt.subplots(figsize=(8, max(3, 0.25 * len(fi))))
+            sns.barplot(x=fi.values, y=fi.index, ax=ax6)
+            ax6.set_title('Top feature importances')
+            st.pyplot(fig6)
+        elif hasattr(model, 'coef_'):
+            coef = model.coef_
+            if coef.ndim == 1:
+                coef_s = pd.Series(coef, index=X_test.columns).sort_values(key=abs, ascending=False).head(20)
+                fig7, ax7 = plt.subplots(figsize=(8, max(3, 0.25 * len(coef_s))))
+                sns.barplot(x=coef_s.values, y=coef_s.index, ax=ax7)
+                ax7.set_title('Top coefficients (by magnitude)')
+                st.pyplot(fig7)
+    except Exception as e:
+        st.info(f"Could not compute feature importances/coefficients: {e}")
+
 if task == "classification":
     unique_classes = np.unique(y_train) if y_train is not None else []
     if y_train is None or len(unique_classes) < 2:
         st.error("Classification requires at least 2 classes with enough samples.")
     else:
-        # Define classifiers
+        model_choices = st.multiselect("Select models to train (order matters for display):", ["Random Forest", "Decision Tree", "Logistic Regression"], default=["Random Forest", "Logistic Regression"])
+
         classifiers = {
-            "Random Forest": RandomForestClassifier(random_state=random_state),
+            "Random Forest": RandomForestClassifier(random_state=random_state, n_jobs=-1),
             "Decision Tree": DecisionTreeClassifier(random_state=random_state),
-            "Logistic Regression": LogisticRegression(max_iter=1000, solver="lbfgs")
+            "Logistic Regression": LogisticRegression(max_iter=2000, solver="lbfgs")
         }
+
+        trained_models = {}
         metrics = {}
-        for name, clf in classifiers.items():
+        for name in model_choices:
+            clf = classifiers.get(name)
+            if clf is None:
+                continue
             try:
                 if has_nan_or_inf(X_train.values) or has_nan_or_inf(np.asarray(y_train)):
                     raise ValueError("Training data contains NaN/inf. Ensure imputation.")
                 clf.fit(X_train, y_train)
+                trained_models[name] = clf
                 y_pred = clf.predict(X_test)
                 metrics[name] = {
                     "Accuracy": float(accuracy_score(y_test, y_pred)),
@@ -379,34 +481,19 @@ if task == "classification":
                 }
             except Exception as e:
                 metrics[name] = {"error": str(e)}
-        st.subheader("Classification results (test set)")
+
+        st.subheader("Classification summary (test set)")
         st.table(pd.DataFrame(metrics).T)
 
-        # show confusion matrix for best model
-        valid = {k: v for k, v in metrics.items() if "F1" in v}
-        if valid:
-            best = max(valid.items(), key=lambda t: t[1]["F1"])[0]
-            st.write(f"Best model by F1: {best}")
-            try:
-                model = classifiers[best]
-                y_pred = model.predict(X_test)
-                cm = confusion_matrix(y_test, y_pred)
-                fig, ax = plt.subplots(figsize=(6, 4))
-                sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax)
-                ax.set_title(f"Confusion Matrix — {best}")
-                ax.set_xlabel("Predicted")
-                ax.set_ylabel("Actual")
-                st.pyplot(fig)
-                st.text("Classification report:")
-                st.text(classification_report(y_test, y_pred, zero_division=0))
-            except Exception as e:
-                st.warning(f"Could not display confusion matrix: {e}")
+        # Show detailed report for each trained model
+        for name, model in trained_models.items():
+            with st.expander(f"Detailed results — {name}", expanded=False):
+                display_classification_results(model, X_test, y_test, label_enc=label_enc, model_name=name)
 
 elif task == "regression":
     if y_train is None:
         st.error("Regression requires a numeric target.")
     else:
-        # Impute if necessary
         if has_nan_or_inf(X_train.values):
             st.warning("Imputing NaNs in features before training.")
             imputer = SimpleImputer(strategy=impute_strategy)
@@ -424,11 +511,13 @@ elif task == "regression":
             "Linear Regression": LinearRegression()
         }
         metrics = {}
+        trained = {}
         for name, reg in regressors.items():
             try:
                 if X_train.shape[0] < 2:
                     raise ValueError("Not enough training samples for regression.")
                 reg.fit(X_train, y_train)
+                trained[name] = reg
                 y_pred = reg.predict(X_test)
                 metrics[name] = {
                     "R2": float(r2_score(y_test, y_pred)),
@@ -439,6 +528,30 @@ elif task == "regression":
                 metrics[name] = {"error": str(e)}
         st.subheader("Regression results (test set)")
         st.table(pd.DataFrame(metrics).T)
+
+        # Visualize residuals for best regressor by R2
+        valid = {k: v for k, v in metrics.items() if "R2" in v}
+        if valid:
+            best = max(valid.items(), key=lambda t: t[1]["R2"])[0]
+            st.write(f"Best model by R2: {best}")
+            try:
+                model = trained[best]
+                y_pred = model.predict(X_test)
+                fig, ax = plt.subplots(figsize=(7, 5))
+                ax.scatter(y_test, y_pred, alpha=0.7)
+                ax.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'k--', lw=2)
+                ax.set_xlabel('Actual')
+                ax.set_ylabel('Predicted')
+                ax.set_title('Actual vs Predicted')
+                st.pyplot(fig)
+
+                resid = y_test - y_pred
+                fig2, ax2 = plt.subplots(figsize=(7, 4))
+                sns.histplot(resid, kde=True, ax=ax2)
+                ax2.set_title('Residual distribution')
+                st.pyplot(fig2)
+            except Exception as e:
+                st.warning(f"Could not display regression plots: {e}")
 
 elif task == "clustering":
     st.subheader("Clustering (unsupervised)")
@@ -467,12 +580,13 @@ elif task == "clustering":
 # -------------------------
 # Cross-validation
 # -------------------------
+with st.sidebar.expander("5) Cross-validation", expanded=False):
+    requested_splits = int(st.number_input("K-Fold splits", min_value=2, max_value=20, value=5))
+
 st.header("Cross-validation")
-requested_splits = int(st.sidebar.number_input("K-Fold splits", min_value=2, max_value=20, value=5))
 cv_results = {}
 
 if task in ("classification", "regression") and y is not None:
-    # Prepare X_cv, y_cv: impute X if needed, drop NaN targets
     if has_nan_or_inf(X.values) or np.isnan(y).any():
         st.warning("Imputing remaining NaNs in features and dropping NaNs in target before CV.")
         imputer = SimpleImputer(strategy=impute_strategy)
@@ -503,7 +617,6 @@ if task in ("classification", "regression") and y is not None:
                 if min_count >= n_splits:
                     cv_strategy = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
                 else:
-                    # try reduce n_splits to min_count if possible
                     if min_count >= 2:
                         n_splits_reduced = min(n_splits, min_count)
                         cv_strategy = StratifiedKFold(n_splits=n_splits_reduced, shuffle=True, random_state=random_state)
@@ -547,18 +660,23 @@ else:
 st.write(cv_results)
 
 # -------------------------
-# Visualizations (improved readability)
+# Visualizations (improved readability and alignment to task)
 # -------------------------
 st.header("Visualizations")
 
-# 1) Distribution of a selected categorical column with aggregation for readability
+# Dataset-level insights
+with st.expander("Dataset insights", expanded=False):
+    st.subheader("Column cardinality summary")
+    st.dataframe(summarize_cardinality(df))
+
+# 1) Distribution of a selected categorical column with aggregation
 st.subheader("Categorical distribution (top categories aggregated)")
-cat_col = st.selectbox("Select a categorical column to display", options=[c for c in df.columns if df[c].dtype == "object" or df[c].dtype.name.startswith("category")] + [""])
+cat_columns = [c for c in df.columns if df[c].dtype == "object" or df[c].dtype.name.startswith("category")]
+cat_col = st.selectbox("Select a categorical column to display", options=cat_columns + [""] )
 if cat_col:
     top_n = st.slider("Top N categories to show (others -> Other)", min_value=5, max_value=50, value=15)
     series = df[cat_col].fillna("NaN").astype(str)
     agg = aggregate_small_categories(series, top_n=top_n)
-    # horizontal bar chart
     fig, ax = plt.subplots(figsize=(8, min(6, 0.25 * len(agg))))
     agg.sort_values().plot(kind="barh", ax=ax, color=sns.color_palette("tab10", n_colors=len(agg)))
     ax.set_xlabel("Count")
@@ -568,7 +686,7 @@ if cat_col:
         ax.text(v + max(agg.max()*0.01, 1e-6), i, str(int(v)), va="center")
     st.pyplot(fig)
 
-# 2) Risk_Level if present (improved)
+# 2) Risk_Level if present
 if "Risk_Level" in df.columns:
     st.subheader("Risk_Level distribution (improved)")
     rl = df["Risk_Level"].fillna("NaN").astype(str)
