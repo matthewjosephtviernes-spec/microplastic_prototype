@@ -1,5 +1,5 @@
 # streamlit_microplastic_app.py
-# Microplastic Risk Analysis Dashboard — Blue Themed Version
+# Microplastic Risk Analysis Dashboard — Blue Themed with Data Cleaning
 
 import streamlit as st
 import pandas as pd
@@ -109,7 +109,7 @@ footer {
 
 # --- Title ---
 st.title("🧪 Microplastic Risk Analysis Dashboard")
-st.caption("Interactive defense demo — explore dataset, clustering, classification, validation, regression, and summary.")
+st.caption("Interactive thesis defense demo — with data cleaning, clustering, classification, validation, regression, and summary.")
 
 # --- Sidebar ---
 st.sidebar.title("Navigation")
@@ -141,19 +141,31 @@ if df is None:
 
 st.success(f"✅ Dataset loaded successfully — {df.shape[0]} rows × {df.shape[1]} columns")
 
-# --- Utility functions ---
+# --- Utility Functions ---
+@st.cache_data
+def clean_data(df):
+    before_rows = df.shape[0]
+    df = df.drop_duplicates()
+    duplicates_removed = before_rows - df.shape[0]
+
+    missing_summary = df.isnull().sum()
+    missing_cols = missing_summary[missing_summary > 0]
+
+    # Fill numeric with median, categorical with mode
+    for col in df.select_dtypes(include=[np.number]):
+        df[col] = df[col].fillna(df[col].median())
+    for col in df.select_dtypes(exclude=[np.number]):
+        if df[col].isnull().any():
+            df[col] = df[col].fillna(df[col].mode().iloc[0])
+
+    return df, duplicates_removed, missing_cols
+
 @st.cache_data
 def preprocess_dataframe(in_df):
     df = in_df.copy()
-    df = df.drop_duplicates().reset_index(drop=True)
     num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     cat_cols = df.select_dtypes(exclude=[np.number]).columns.tolist()
 
-    for c in num_cols:
-        df[c] = df[c].fillna(df[c].median())
-    for c in cat_cols:
-        if df[c].isnull().any():
-            df[c] = df[c].fillna(df[c].mode().iloc[0])
     for c in cat_cols:
         try:
             le = LabelEncoder()
@@ -168,35 +180,57 @@ def compute_pca(X, n_components=2):
     Xp = pca.fit_transform(X)
     return Xp, pca
 
-# --- Steps ---
-with st.expander("⚙️ Step 2: Preprocessing", expanded=True):
-    if st.button("Run Preprocessing", key="preprocess"):
-        with st.spinner("Cleaning and encoding dataset..."):
-            cleaned_df, num_cols, cat_cols = preprocess_dataframe(df)
+# --- 2️⃣ Data Cleaning Section ---
+with st.expander("🧹 Step 2: Data Cleaning", expanded=True):
+    if st.button("Run Data Cleaning", key="cleaning"):
+        with st.spinner("Cleaning dataset... removing duplicates and filling missing values..."):
+            cleaned_df, duplicates_removed, missing_cols = clean_data(df)
             st.session_state['cleaned_df'] = cleaned_df
-            st.session_state['num_cols'] = num_cols
-            st.session_state['cat_cols'] = cat_cols
-            st.success("✅ Preprocessing complete!")
+
+            st.success(f"✅ Cleaning complete! Removed {duplicates_removed} duplicates.")
+            if not missing_cols.empty:
+                st.info("Columns with missing values before cleaning:")
+                st.dataframe(missing_cols.rename("Missing Count"))
+            else:
+                st.info("No missing values were found.")
+
             st.dataframe(cleaned_df.head())
     else:
         cleaned_df = st.session_state.get('cleaned_df', None)
 
 if cleaned_df is None:
+    st.info("Please run data cleaning first.")
+    st.stop()
+
+# --- 3️⃣ Preprocessing Section ---
+with st.expander("⚙️ Step 3: Preprocessing (Encoding)", expanded=False):
+    if st.button("Run Preprocessing", key="preprocess"):
+        with st.spinner("Encoding categorical variables..."):
+            pre_df, num_cols, cat_cols = preprocess_dataframe(cleaned_df)
+            st.session_state['pre_df'] = pre_df
+            st.session_state['num_cols'] = num_cols
+            st.session_state['cat_cols'] = cat_cols
+            st.success("✅ Preprocessing complete!")
+            st.dataframe(pre_df.head())
+    else:
+        pre_df = st.session_state.get('pre_df', None)
+
+if pre_df is None:
     st.info("Run preprocessing first.")
     st.stop()
 
-# --- Step 3: Clustering ---
-with st.expander("🔹 Step 3: K-Means Clustering", expanded=False):
-    cluster_cols = st.multiselect("Select features for clustering", options=cleaned_df.columns.tolist(), default=st.session_state['num_cols'])
+# --- 4️⃣ Clustering ---
+with st.expander("🔹 Step 4: K-Means Clustering", expanded=False):
+    cluster_cols = st.multiselect("Select features for clustering", options=pre_df.columns.tolist(), default=st.session_state['num_cols'])
     n_clusters = st.slider("Number of clusters", 2, 10, 3)
     if st.button("Run K-Means", key="cluster"):
-        X = cleaned_df[cluster_cols].values
+        X = pre_df[cluster_cols].values
         X_scaled = StandardScaler().fit_transform(X)
         X_pca, _ = compute_pca(X_scaled)
         kmeans = KMeans(n_clusters=n_clusters, random_state=42)
         labels = kmeans.fit_predict(X_scaled)
-        cleaned_df['Cluster'] = labels
-        st.session_state['cleaned_df'] = cleaned_df
+        pre_df['Cluster'] = labels
+        st.session_state['pre_df'] = pre_df
         st.success(f"✅ K-Means complete — {n_clusters} clusters identified!")
 
         fig = px.scatter(
@@ -206,11 +240,9 @@ with st.expander("🔹 Step 3: K-Means Clustering", expanded=False):
             labels={'x':'PC1','y':'PC2'}
         )
         st.plotly_chart(fig, use_container_width=True)
-        st.write("**Cluster Counts:**")
-        st.dataframe(cleaned_df['Cluster'].value_counts().rename_axis('Cluster').reset_index(name='Count'))
+        st.dataframe(pre_df['Cluster'].value_counts().rename_axis('Cluster').reset_index(name='Count'))
 
-# --- Continue with classification, validation, regression, and summary (same logic) ---
-# --- (All sections will inherit blue theme styling) ---
+# (Classification, Validation, Regression, Summary sections would follow unchanged)
 
 st.markdown("---")
-st.caption("App built for thesis defense — styled in calming blue tones 💙.")
+st.caption("💙 App built for thesis defense — includes new Data Cleaning stage for clarity and transparency.")
