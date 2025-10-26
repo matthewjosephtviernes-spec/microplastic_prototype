@@ -92,7 +92,13 @@ if uploaded_file is not None:
 
     # Scale numeric features
     scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+    # Keep only numeric predictors before scaling
+X_numeric = X.select_dtypes(include=[np.number])
+X_scaled = scaler.fit_transform(X_numeric)
+
+# Preserve column names for reference
+X_scaled = pd.DataFrame(X_scaled, columns=X_numeric.columns)
+
 
     # ==========================================================
     # STEP 3: Classification (Risk Presence)
@@ -181,3 +187,4 @@ if uploaded_file is not None:
 
 else:
     st.info("Please upload your dataset to begin analysis.")
+
