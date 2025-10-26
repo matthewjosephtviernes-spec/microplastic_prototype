@@ -1,6 +1,5 @@
 # ==========================================================
 # 🌊 Predictive Risk Modeling for Microplastic Pollution
-# Data Mining App using Streamlit
 # ==========================================================
 
 import pandas as pd
@@ -9,7 +8,7 @@ import streamlit as st
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.cluster import KMeans
 from sklearn.linear_model import LinearRegression
@@ -82,30 +81,33 @@ if uploaded_file is not None:
     # STEP 2: Feature Selection
     # ==========================================================
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+
+    # Set target variable (use MP_Count if available)
     if 'MP_Count (items/individual)' in numeric_cols:
         target = 'MP_Count (items/individual)'
     else:
-        target = numeric_cols[-1]  # fallback
+        target = numeric_cols[-1]
 
-    X = df.drop(columns=[target])
+    X = df.drop(columns=[target], errors='ignore')
     y = df[target]
 
-    # Scale numeric features
+    # Keep only numeric columns for scaling
+    X_numeric = X.select_dtypes(include=[np.number])
+    non_numeric_cols = X.select_dtypes(exclude=[np.number]).columns.tolist()
+    if non_numeric_cols:
+        st.warning(f"⚠️ The following non-numeric columns were excluded from modeling: {non_numeric_cols}")
+
+    # Scale numeric features safely
     scaler = StandardScaler()
-    # Keep only numeric predictors before scaling
-X_numeric = X.select_dtypes(include=[np.number])
-X_scaled = scaler.fit_transform(X_numeric)
-
-# Preserve column names for reference
-X_scaled = pd.DataFrame(X_scaled, columns=X_numeric.columns)
-
+    X_scaled = scaler.fit_transform(X_numeric)
+    X_scaled = pd.DataFrame(X_scaled, columns=X_numeric.columns)
 
     # ==========================================================
-    # STEP 3: Classification (Risk Presence)
+    # STEP 3: Classification (Predicting MP Presence)
     # ==========================================================
     st.subheader("🧠 Classification: Predicting Microplastic Presence")
     if 'MP_Presence' in df.columns:
-        X_class = df.drop(columns=['MP_Presence', target])
+        X_class = df.select_dtypes(include=[np.number]).drop(columns=['MP_Presence', target], errors='ignore')
         y_class = df['MP_Presence']
 
         X_train, X_test, y_train, y_test = train_test_split(X_class, y_class, test_size=0.2, random_state=42)
@@ -132,7 +134,7 @@ X_scaled = pd.DataFrame(X_scaled, columns=X_numeric.columns)
         st.write("**Cross-Validation Accuracy:**", round(cv_score, 3))
 
     # ==========================================================
-    # STEP 4: Clustering (Grouping Similar Sites)
+    # STEP 4: Clustering (Group Similar Sites)
     # ==========================================================
     st.subheader("📊 Clustering: Grouping Similar Sampling Areas")
     kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
@@ -142,9 +144,9 @@ X_scaled = pd.DataFrame(X_scaled, columns=X_numeric.columns)
     st.write("Cluster Distribution:")
     st.bar_chart(df['Cluster'].value_counts())
 
-    # 2D visualization (first two principal numeric features)
+    # 2D Visualization
     fig, ax = plt.subplots()
-    ax.scatter(X_scaled[:, 0], X_scaled[:, 1], c=clusters, cmap='viridis')
+    ax.scatter(X_scaled.iloc[:, 0], X_scaled.iloc[:, 1], c=clusters, cmap='viridis')
     ax.set_xlabel("Feature 1")
     ax.set_ylabel("Feature 2")
     ax.set_title("K-Means Clustering Visualization")
@@ -163,7 +165,6 @@ X_scaled = pd.DataFrame(X_scaled, columns=X_numeric.columns)
     st.write("**Mean Squared Error:**", round(mean_squared_error(y_test, y_pred), 3))
     st.write("**R² Score:**", round(r2_score(y_test, y_pred), 3))
 
-    # Scatter plot of actual vs predicted
     fig, ax = plt.subplots()
     ax.scatter(y_test, y_pred, alpha=0.7)
     ax.set_xlabel("Actual MP Count")
@@ -172,19 +173,18 @@ X_scaled = pd.DataFrame(X_scaled, columns=X_numeric.columns)
     st.pyplot(fig)
 
     # ==========================================================
-    # STEP 6: Insights Summary
+    # STEP 6: Summary of Results
     # ==========================================================
     st.subheader("🧾 Summary of Results")
     st.markdown("""
-    - **Data Cleaning & Preprocessing:** Handled duplicates, encoded categorical and text features.
-    - **Classification:** Predicted presence of microplastics (Yes/No) with measurable accuracy.
-    - **Clustering:** Grouped sampling sites with similar microplastic characteristics.
+    - **Preprocessing:** Categorical and text data converted to numeric predictors.
+    - **Classification:** Predicted presence of microplastics with measurable accuracy.
+    - **Clustering:** Identified patterns among sampling areas.
     - **Regression:** Modeled microplastic count using numeric predictors.
-    - **Validation:** Used cross-validation and visualization to ensure reliability.
+    - **Validation:** Cross-validation and metrics provide interpretability.
 
-    ✅ *This provides clear, interpretable results for discussion and conclusion chapters.*
+    ✅ *Results ready for Chapter 5 discussion and conclusion.*
     """)
 
 else:
     st.info("Please upload your dataset to begin analysis.")
-
