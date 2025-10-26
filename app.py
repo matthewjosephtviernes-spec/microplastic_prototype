@@ -1,4 +1,4 @@
-# app.py (Enhanced Version with Readable Feature Importance Chart)
+# app.py (Enhanced with Raw, Cleaned, and Structured Data Views)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -41,14 +41,6 @@ st.markdown("""
         box-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.37);
         backdrop-filter: blur(8px);
     }
-    .metric-card {
-        border-radius: 12px;
-        background: rgba(255,255,255,0.1);
-        padding: 20px;
-        text-align: center;
-        margin: 10px;
-        box-shadow: 0 0 10px rgba(0,255,255,0.3);
-    }
     </style>
 """, unsafe_allow_html=True)
 
@@ -57,7 +49,7 @@ st.markdown('<h1 class="glow">🌊 Predictive Risk Modeling System for Microplas
 # ------------------- SIDEBAR ------------------- #
 st.sidebar.title("🧭 Navigation")
 page = st.sidebar.radio("Go to:", [
-    "📂 Upload Dataset",
+    "📂 Upload & Preprocess Data",
     "🤖 Train Predictive Model",
     "📊 Visualization",
     "📈 Risk Level Predictions",
@@ -65,24 +57,53 @@ page = st.sidebar.radio("Go to:", [
 ])
 
 # ------------------- SESSION STATE ------------------- #
-for key in ['df', 'model', 'X', 'y', 'predictions', 'le']:
+for key in ['df_raw', 'df_cleaned', 'df_structured', 'model', 'X', 'y', 'predictions', 'le']:
     if key not in st.session_state:
         st.session_state[key] = None
 
-# ------------------- UPLOAD DATASET ------------------- #
-if page == "📂 Upload Dataset":
+# ------------------- UPLOAD & PREPROCESS DATA ------------------- #
+if page == "📂 Upload & Preprocess Data":
     st.markdown('<div class="glass">', unsafe_allow_html=True)
-    st.header("1️⃣ Upload Dataset")
+    st.header("1️⃣ Upload and Preprocess Dataset")
 
     uploaded_file = st.file_uploader("Upload your CSV file", type=['csv'])
     if uploaded_file:
         try:
-            df = pd.read_csv(uploaded_file)
-            st.session_state.df = df
+            df_raw = pd.read_csv(uploaded_file)
+            st.session_state.df_raw = df_raw.copy()
             st.success("✅ Dataset uploaded successfully!")
-            st.dataframe(df.head(), use_container_width=True)
+
+            st.subheader("📘 Raw Data")
+            st.dataframe(df_raw.head(), use_container_width=True)
+
+            # ----- Data Cleaning -----
+            df_cleaned = df_raw.drop_duplicates()
+            df_cleaned = df_cleaned.dropna(how='all')  # remove empty rows
+            df_cleaned = df_cleaned.fillna(df_cleaned.mean(numeric_only=True))  # fill numeric NaN with mean
+
+            st.session_state.df_cleaned = df_cleaned
+
+            st.subheader("🧹 Cleaned Data")
+            st.write("Removed duplicates, handled missing values.")
+            st.dataframe(df_cleaned.head(), use_container_width=True)
+
+            # ----- Structuring -----
+            # Encode non-numeric features
+            df_structured = df_cleaned.copy()
+            for col in df_structured.select_dtypes(include='object').columns:
+                df_structured[col] = df_structured[col].astype(str)
+            df_structured = pd.get_dummies(df_structured, drop_first=True)
+
+            st.session_state.df_structured = df_structured
+
+            st.subheader("🏗️ Structured Data (Ready for Modeling)")
+            st.write("Encoded categorical features and formatted numeric data.")
+            st.dataframe(df_structured.head(), use_container_width=True)
+
+            st.success("✅ Data successfully cleaned and structured!")
+
         except Exception as e:
-            st.error(f"Error reading file: {e}")
+            st.error(f"Error reading or processing file: {e}")
     else:
         st.info("📁 Please upload a CSV file to continue.")
     st.markdown('</div>', unsafe_allow_html=True)
@@ -92,8 +113,8 @@ elif page == "🤖 Train Predictive Model":
     st.markdown('<div class="glass">', unsafe_allow_html=True)
     st.header("2️⃣ Train Predictive Model")
 
-    if st.session_state.df is not None:
-        df = st.session_state.df
+    if st.session_state.df_structured is not None:
+        df = st.session_state.df_structured
         target_col = st.selectbox("🎯 Select Target Column", df.columns)
         features = st.multiselect("🧩 Select Feature Columns", [c for c in df.columns if c != target_col])
         model_choice = st.selectbox("🤔 Choose Model", ["Random Forest", "Logistic Regression", "Decision Tree"])
@@ -113,9 +134,7 @@ elif page == "🤖 Train Predictive Model":
                         y = le.fit_transform(y)
                         st.session_state.le = le
 
-                    X = pd.get_dummies(X, drop_first=True)
                     st.session_state.X, st.session_state.y = X, y
-
                     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
                     if model_choice == "Random Forest":
@@ -144,7 +163,7 @@ elif page == "🤖 Train Predictive Model":
                     col4.metric("F1 Score", f"{f1:.2f}")
 
     else:
-        st.warning("Please upload a dataset first.")
+        st.warning("Please upload and preprocess your dataset first.")
     st.markdown('</div>', unsafe_allow_html=True)
 
 # ------------------- VISUALIZATION ------------------- #
@@ -152,11 +171,11 @@ elif page == "📊 Visualization":
     st.markdown('<div class="glass">', unsafe_allow_html=True)
     st.header("3️⃣ Data Visualization")
 
-    if st.session_state.df is not None and st.session_state.model is not None:
+    if st.session_state.df_structured is not None and st.session_state.model is not None:
         X = st.session_state.X
         model = st.session_state.model
 
-        # ------------------- Improved Feature Importance ------------------- #
+        # ------------------- Feature Importance ------------------- #
         if hasattr(model, "feature_importances_"):
             st.subheader("📈 Top 15 Most Important Features")
             importances = pd.DataFrame({
@@ -187,7 +206,7 @@ elif page == "📊 Visualization":
 
         # ------------------- Correlation Heatmap ------------------- #
         st.subheader("🔥 Correlation Heatmap")
-        numeric_df = st.session_state.df.select_dtypes(include=np.number)
+        numeric_df = st.session_state.df_structured.select_dtypes(include=np.number)
         if not numeric_df.empty:
             corr = numeric_df.corr()
             fig2 = ff.create_annotated_heatmap(
@@ -226,7 +245,6 @@ elif page == "📈 Risk Level Predictions":
         st.write(f"🔁 Recall: {recall_score(y_true, preds, average='weighted'):.2f}")
         st.write(f"⭐ F1 Score: {f1_score(y_true, preds, average='weighted'):.2f}")
 
-        # Confusion Matrix
         st.subheader("📉 Confusion Matrix")
         cm = confusion_matrix(y_true, preds)
         fig_cm = px.imshow(cm, text_auto=True, color_continuous_scale='Blues', labels=dict(x="Predicted", y="Actual"))
