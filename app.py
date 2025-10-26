@@ -1,223 +1,183 @@
-# ==============================================================
-# Predictive Risk Modeling for Microplastic Pollution
-# Developed by: Magdaluyo & Viernes
-# ==============================================================
+# ==========================================================
+# 🌊 Predictive Risk Modeling for Microplastic Pollution
+# Data Mining App using Streamlit
+# ==========================================================
 
-import streamlit as st
 import pandas as pd
 import numpy as np
+import streamlit as st
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.preprocessing import LabelEncoder
-from sklearn.cluster import KMeans
-from sklearn.model_selection import train_test_split, KFold, cross_val_score
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
-# --------------------------------------------------------------
-# PAGE CONFIGURATION
-# --------------------------------------------------------------
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.cluster import KMeans
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    classification_report, confusion_matrix, accuracy_score,
+    mean_squared_error, r2_score
+)
+
+# -------------------------------
+# Streamlit App Setup
+# -------------------------------
 st.set_page_config(page_title="Microplastic Risk Prediction", layout="wide")
 st.title("🌊 Predictive Risk Modeling for Microplastic Pollution")
-st.caption("Developed by: Magdaluyo & Viernes | Agusan del Sur State College of Agriculture and Technology")
+st.caption("Upload your dataset to preprocess, model, and validate predictive insights on microplastic pollution risks.")
 
-st.markdown("""
-This app demonstrates how **data mining techniques** such as *clustering* and *classification*
-can predict and visualize the **risk of microplastic pollution** based on extracted datasets.
-""")
+# -------------------------------
+# Upload Dataset
+# -------------------------------
+uploaded_file = st.file_uploader("📂 Upload your CSV dataset", type=["csv"])
 
-# --------------------------------------------------------------
-# DATA UPLOAD SECTION
-# --------------------------------------------------------------
-st.header("1️⃣ Upload and Inspect Data")
-
-uploaded_file = st.file_uploader("Upload your preprocessed dataset (.csv)", type="csv")
-
-if uploaded_file:
-    try:
-        df = pd.read_csv(uploaded_file)
-    except Exception as e:
-        st.error(f"Error reading CSV file: {e}")
-        st.stop()
-
-    st.success("✅ Data loaded successfully!")
-    st.write("**Preview of Dataset:**")
+if uploaded_file is not None:
+    df = pd.read_csv(uploaded_file)
+    st.subheader("📋 Raw Dataset Preview")
     st.dataframe(df.head())
 
-    # Basic info
-    st.write("**Dataset Summary:**")
-    st.write(df.describe(include="all"))
+    # ==========================================================
+    # STEP 1: Data Cleaning
+    # ==========================================================
+    df = df.drop_duplicates()
+    df = df.fillna('')
 
-    # Data cleaning
-    st.subheader("Data Cleaning Overview")
-    st.write(f"Initial rows: {len(df)}")
-    df.drop_duplicates(inplace=True)
-    st.write(f"After removing duplicates: {len(df)}")
-    st.write("Missing Values per Column:")
-    st.write(df.isnull().sum())
+    # Convert numeric column
+    if 'MP_Count (items/individual)' in df.columns:
+        df['MP_Count (items/individual)'] = pd.to_numeric(df['MP_Count (items/individual)'], errors='coerce')
 
-    # ----------------------------------------------------------
-    # VISUAL EXPLORATION
-    # ----------------------------------------------------------
-    st.header("2️⃣ Data Visualization")
+    # Encode binary columns
+    if 'MP_Presence' in df.columns:
+        df['MP_Presence'] = df['MP_Presence'].map({'Yes': 1, 'No': 0})
 
-    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    cat_cols = df.select_dtypes(exclude=[np.number]).columns.tolist()
+    # Multi-label feature expansion
+    multi_cols = ['MP_Type', 'MP_Structure', 'MP_Color', 'Polymer_Type', 'Dominant_Risk_Type']
+    for col in multi_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna('')
+            unique_tokens = set()
+            for val in df[col]:
+                unique_tokens.update([v.strip() for v in str(val).split(',') if v.strip() != ''])
+            for token in unique_tokens:
+                df[token] = df[col].apply(lambda x: 1 if token in str(x) else 0)
 
-    if num_cols:
-        st.subheader("📊 Correlation Heatmap")
-        plt.figure(figsize=(8, 5))
-        sns.heatmap(df[num_cols].corr(), annot=True, cmap="coolwarm")
-        st.pyplot(plt.gcf())
-        plt.clf()
+    # One-hot encode simple categorical columns
+    cat_cols = ['Study_Location', 'Site / Sampling_Area', 'Habitat_Type', 'Species_Name']
+    cat_cols = [c for c in cat_cols if c in df.columns]
+    df = pd.get_dummies(df, columns=cat_cols, drop_first=True)
 
-    if cat_cols:
-        st.subheader("📈 Distribution of Categorical Columns")
-        for col in cat_cols[:3]:  # Limit to first 3
-            st.bar_chart(df[col].value_counts())
+    # Drop non-informative columns
+    for col in ['Source_Suspected', 'Author']:
+        if col in df.columns:
+            df = df.drop(columns=[col])
 
-    # ----------------------------------------------------------
-    # CLUSTERING SECTION
-    # ----------------------------------------------------------
-    st.header("3️⃣ Clustering Analysis (K-Means)")
-    if num_cols:
-        if len(num_cols) < 2:
-            st.warning("At least 2 numeric columns are required for the default K-Means scatter visualization. Clustering will still run but visualization will be a distribution plot.")
-        k = st.slider("Select number of clusters", 2, 6, 3)
+    # Handle missing numeric values
+    df = df.fillna(0)
 
-        # Prepare numeric data for clustering: drop rows with missing numeric values
-        df_num = df[num_cols].dropna()
-        if df_num.empty:
-            st.error("No rows with complete numeric data available for clustering. Please clean or impute missing values.")
-        else:
-            # Use an integer n_init for compatibility across sklearn versions
-            kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
-            cluster_labels = kmeans.fit_predict(df_num)
+    st.subheader("✅ Preprocessed Numeric Dataset")
+    st.dataframe(df.head())
+    st.write("Shape:", df.shape)
 
-            # Assign cluster labels back to the original dataframe aligning by index
-            df.loc[df_num.index, "Cluster"] = cluster_labels
-            df["Cluster"] = df["Cluster"].astype("Int64")  # allow NA clusters for rows dropped earlier
-
-            st.write("Cluster counts:")
-            st.write(df["Cluster"].value_counts(dropna=True))
-            st.write("Cluster Visualization:")
-
-            plt.figure(figsize=(7, 5))
-            if len(num_cols) >= 2:
-                sns.scatterplot(x=num_cols[0], y=num_cols[1], hue="Cluster", data=df.loc[df_num.index], palette="viridis")
-                plt.title("K-Means Clustering Visualization")
-                st.pyplot(plt.gcf())
-                plt.clf()
-            else:
-                # If only one numeric column is present, show cluster-wise distribution for that column
-                single_col = num_cols[0]
-                sns.boxplot(x="Cluster", y=single_col, data=df.loc[df_num.index], palette="viridis")
-                plt.title(f"Cluster distribution on {single_col}")
-                st.pyplot(plt.gcf())
-                plt.clf()
-
+    # ==========================================================
+    # STEP 2: Feature Selection
+    # ==========================================================
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if 'MP_Count (items/individual)' in numeric_cols:
+        target = 'MP_Count (items/individual)'
     else:
-        st.info("No numeric columns found in the dataset. K-Means requires numeric features.")
+        target = numeric_cols[-1]  # fallback
 
-    # ----------------------------------------------------------
-    # CLASSIFICATION MODEL
-    # ----------------------------------------------------------
-    st.header("4️⃣ Classification and Prediction")
+    X = df.drop(columns=[target])
+    y = df[target]
 
-    target_col = st.selectbox("Select Target Column (Risk Category)", options=df.columns)
-    features = [col for col in df.columns if col != target_col]
+    # Scale numeric features
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
 
-    if st.button("Run Classification Model"):
-        # Prepare target
-        y = df[target_col]
+    # ==========================================================
+    # STEP 3: Classification (Risk Presence)
+    # ==========================================================
+    st.subheader("🧠 Classification: Predicting Microplastic Presence")
+    if 'MP_Presence' in df.columns:
+        X_class = df.drop(columns=['MP_Presence', target])
+        y_class = df['MP_Presence']
 
-        # Encode target if it's categorical/object
-        le = LabelEncoder()
-        if y.dtype == 'object' or y.dtype.name == 'category':
-            try:
-                y = pd.Series(le.fit_transform(y), index=y.index)
-            except Exception as e:
-                st.error(f"Error encoding target column: {e}")
-                st.stop()
+        X_train, X_test, y_train, y_test = train_test_split(X_class, y_class, test_size=0.2, random_state=42)
 
-        # Prepare features: select numeric columns only
-        X = df[features].select_dtypes(include=[np.number])
+        clf = RandomForestClassifier(random_state=42)
+        clf.fit(X_train, y_train)
+        y_pred = clf.predict(X_test)
 
-        if X.shape[1] == 0:
-            st.error("No numeric features available for training. Select a dataset with numeric predictors or preprocess categorical features.")
-            st.stop()
+        st.write("**Accuracy:**", round(accuracy_score(y_test, y_pred), 3))
+        st.text("Classification Report:")
+        st.text(classification_report(y_test, y_pred))
 
-        # Drop rows with missing values in features or target, keeping alignment
-        combined = pd.concat([X, y], axis=1)
-        combined = combined.dropna()
-        if combined.empty:
-            st.error("No rows remain after dropping missing values. Please clean or impute your data.")
-            st.stop()
+        # Confusion Matrix
+        cm = confusion_matrix(y_test, y_pred)
+        fig, ax = plt.subplots()
+        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax)
+        ax.set_title("Confusion Matrix")
+        ax.set_xlabel("Predicted")
+        ax.set_ylabel("Actual")
+        st.pyplot(fig)
 
-        X = combined[X.columns]
-        y = combined[target_col] if target_col in combined.columns else combined.iloc[:, -1]
+        # Cross-validation
+        cv_score = cross_val_score(clf, X_class, y_class, cv=5).mean()
+        st.write("**Cross-Validation Accuracy:**", round(cv_score, 3))
 
-        # Ensure y is numeric after encoding (if it came from object)
-        if y.dtype == 'object' or y.dtype.name == 'category':
-            try:
-                y = pd.Series(le.fit_transform(y), index=y.index)
-            except Exception:
-                st.error("Target column could not be encoded to numeric classes.")
-                st.stop()
+    # ==========================================================
+    # STEP 4: Clustering (Grouping Similar Sites)
+    # ==========================================================
+    st.subheader("📊 Clustering: Grouping Similar Sampling Areas")
+    kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
+    clusters = kmeans.fit_predict(X_scaled)
+    df['Cluster'] = clusters
 
-        # Train/test split
-        try:
-            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-        except Exception as e:
-            st.error(f"Error during train/test split: {e}")
-            st.stop()
+    st.write("Cluster Distribution:")
+    st.bar_chart(df['Cluster'].value_counts())
 
-        # Model training
-        model = RandomForestClassifier(n_estimators=100, random_state=42)
-        try:
-            model.fit(X_train, y_train)
-        except Exception as e:
-            st.error(f"Error training model: {e}")
-            st.stop()
+    # 2D visualization (first two principal numeric features)
+    fig, ax = plt.subplots()
+    ax.scatter(X_scaled[:, 0], X_scaled[:, 1], c=clusters, cmap='viridis')
+    ax.set_xlabel("Feature 1")
+    ax.set_ylabel("Feature 2")
+    ax.set_title("K-Means Clustering Visualization")
+    st.pyplot(fig)
 
-        # Prediction and evaluation
-        try:
-            y_pred = model.predict(X_test)
-            acc = accuracy_score(y_test, y_pred)
-            st.success(f"✅ Model Accuracy: {acc*100:.2f}%")
+    # ==========================================================
+    # STEP 5: Regression (Predicting MP Count)
+    # ==========================================================
+    st.subheader("📈 Regression: Predicting Microplastic Count")
+    X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
 
-            st.text("Classification Report:")
-            st.text(classification_report(y_test, y_pred))
+    model = LinearRegression()
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
 
-            # Confusion matrix
-            st.subheader("Confusion Matrix")
-            cm = confusion_matrix(y_test, y_pred)
-            plt.figure(figsize=(5, 4))
-            sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
-            plt.xlabel("Predicted")
-            plt.ylabel("Actual")
-            st.pyplot(plt.gcf())
-            plt.clf()
+    st.write("**Mean Squared Error:**", round(mean_squared_error(y_test, y_pred), 3))
+    st.write("**R² Score:**", round(r2_score(y_test, y_pred), 3))
 
-            # Cross-validation
-            kf = KFold(n_splits=5, shuffle=True, random_state=42)
-            cv_scores = cross_val_score(model, X, y, cv=kf, scoring='accuracy')
-            st.write(f"**K-Fold Cross Validation Average Accuracy:** {np.mean(cv_scores)*100:.2f}%")
-        except Exception as e:
-            st.error(f"Error during evaluation: {e}")
-            st.stop()
+    # Scatter plot of actual vs predicted
+    fig, ax = plt.subplots()
+    ax.scatter(y_test, y_pred, alpha=0.7)
+    ax.set_xlabel("Actual MP Count")
+    ax.set_ylabel("Predicted MP Count")
+    ax.set_title("Actual vs Predicted Microplastic Count")
+    st.pyplot(fig)
 
-    # ----------------------------------------------------------
-    # SUMMARY
-    # ----------------------------------------------------------
-    st.header("5️⃣ Summary")
-    st.info("""
-    - The **K-Means** clustering grouped samples into distinct ecological, chemical, or human health risks.  
-    - The **Random Forest** classifier achieved strong predictive accuracy (depending on dataset and preprocessing).  
-    - Visual outputs such as heatmaps and scatterplots improve interpretability.  
-    - This system supports data-driven **environmental decision-making**.
+    # ==========================================================
+    # STEP 6: Insights Summary
+    # ==========================================================
+    st.subheader("🧾 Summary of Results")
+    st.markdown("""
+    - **Data Cleaning & Preprocessing:** Handled duplicates, encoded categorical and text features.
+    - **Classification:** Predicted presence of microplastics (Yes/No) with measurable accuracy.
+    - **Clustering:** Grouped sampling sites with similar microplastic characteristics.
+    - **Regression:** Modeled microplastic count using numeric predictors.
+    - **Validation:** Used cross-validation and visualization to ensure reliability.
+
+    ✅ *This provides clear, interpretable results for discussion and conclusion chapters.*
     """)
-else:
-    st.warning("Please upload a dataset to begin analysis.")
 
-st.caption("© 2025 Magdaluyo & Viernes | Microplastic Risk Prediction Project")
+else:
+    st.info("Please upload your dataset to begin analysis.")
