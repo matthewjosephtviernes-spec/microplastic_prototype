@@ -1,5 +1,5 @@
 # streamlit_microplastic_app.py
-# Microplastic Risk Analysis Dashboard — Blue Themed with Data Cleaning
+# Microplastic Risk Analysis Dashboard — Clean & Minimal Theme with Data Cleaning
 
 import streamlit as st
 import pandas as pd
@@ -15,105 +15,101 @@ import plotly.express as px
 # --- Page Config ---
 st.set_page_config(layout="wide", page_title="Microplastic Risk Analysis Dashboard", page_icon="🧪")
 
-# --- Custom CSS Styling (Blue Theme) ---
+# --- Minimal, Clear CSS Styling ---
 st.markdown("""
 <style>
-/* General Background */
+/* App Background */
 [data-testid="stAppViewContainer"] {
-    background: linear-gradient(135deg, #e3f2fd 0%, #bbdefb 100%);
+    background-color: #f9fafb;
+    color: #2c2c2c;
+    font-family: "Inter", sans-serif;
 }
 
 /* Sidebar */
 [data-testid="stSidebar"] {
-    background-color: #1e88e5;
-    color: white;
+    background-color: #f0f2f6;
+    color: #333;
 }
 [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 {
-    color: white;
-}
-[data-testid="stSidebar"] .stButton>button {
-    background-color: #1565c0;
-    color: white;
-    border: none;
-    border-radius: 10px;
-}
-[data-testid="stSidebar"] .stButton>button:hover {
-    background-color: #0d47a1;
-}
-
-/* Titles and captions */
-h1, h2, h3 {
-    color: #0d47a1 !important;
-}
-.stCaption {
-    color: #1565c0 !important;
-    font-style: italic;
+    color: #111;
 }
 
 /* Buttons */
 div.stButton > button {
-    background-color: #1976d2;
+    background-color: #4b8bf5;
     color: white;
     border: none;
-    border-radius: 10px;
+    border-radius: 8px;
     padding: 0.5em 1em;
     transition: 0.3s;
+    font-weight: 500;
 }
 div.stButton > button:hover {
-    background-color: #0d47a1;
-    color: #e3f2fd;
-    transform: scale(1.05);
+    background-color: #316cd8;
+    transform: scale(1.03);
 }
 
 /* Expanders */
 .streamlit-expanderHeader {
-    background-color: #2196f3 !important;
-    color: white !important;
-    border-radius: 5px;
-}
-.streamlit-expanderHeader:hover {
-    background-color: #1976d2 !important;
+    background-color: #ffffff !important;
+    border: 1px solid #e0e0e0;
+    border-radius: 6px;
+    color: #111 !important;
+    font-weight: 600;
 }
 .streamlit-expanderContent {
-    background-color: #f1f8ff;
-    border-left: 3px solid #2196f3;
+    background-color: #fcfcfc;
+    border-left: 3px solid #d0d0d0;
+    border-radius: 6px;
+    padding: 0.5rem 0.5rem;
 }
 
 /* Dataframes */
 [data-testid="stDataFrame"] {
     background-color: #ffffff;
-    border: 1px solid #90caf9;
-    border-radius: 8px;
+    border: 1px solid #e5e7eb;
+    border-radius: 6px;
 }
 
-/* Success, warning, info messages */
+/* Messages */
 .stSuccess {
-    background-color: #bbdefb !important;
-    color: #0d47a1 !important;
-    border: 1px solid #64b5f6;
-    border-radius: 8px;
+    background-color: #e6f4ea !important;
+    color: #1b5e20 !important;
+    border: 1px solid #c8e6c9;
+    border-radius: 6px;
 }
 .stWarning {
-    background-color: #fff9c4 !important;
+    background-color: #fff3cd !important;
+    border: 1px solid #ffeeba;
 }
 .stInfo {
     background-color: #e3f2fd !important;
+    border: 1px solid #bbdefb;
+}
+
+/* Titles */
+h1, h2, h3 {
+    color: #1c1c1c !important;
+}
+
+/* Captions */
+.stCaption {
+    color: #555 !important;
+    font-style: italic;
 }
 
 /* Footer */
-footer {
-    visibility: hidden;
-}
+footer {visibility: hidden;}
 </style>
 """, unsafe_allow_html=True)
 
 # --- Title ---
 st.title("🧪 Microplastic Risk Analysis Dashboard")
-st.caption("Interactive thesis defense demo — with data cleaning, clustering, classification, validation, regression, and summary.")
+st.caption("Interactive thesis defense demo — includes data cleaning, clustering, classification, validation, regression, and summary.")
 
 # --- Sidebar ---
 st.sidebar.title("Navigation")
-st.sidebar.info("Use buttons to manually trigger each stage for your thesis defense.")
+st.sidebar.info("Use the buttons below to move through each step of the analysis process.")
 
 st.sidebar.header("1️⃣ Upload or Load Dataset")
 uploaded_file = st.sidebar.file_uploader("Upload your .csv dataset", type=["csv"])
@@ -151,7 +147,6 @@ def clean_data(df):
     missing_summary = df.isnull().sum()
     missing_cols = missing_summary[missing_summary > 0]
 
-    # Fill numeric with median, categorical with mode
     for col in df.select_dtypes(include=[np.number]):
         df[col] = df[col].fillna(df[col].median())
     for col in df.select_dtypes(exclude=[np.number]):
@@ -183,7 +178,7 @@ def compute_pca(X, n_components=2):
 # --- 2️⃣ Data Cleaning Section ---
 with st.expander("🧹 Step 2: Data Cleaning", expanded=True):
     if st.button("Run Data Cleaning", key="cleaning"):
-        with st.spinner("Cleaning dataset... removing duplicates and filling missing values..."):
+        with st.spinner("Cleaning dataset... removing duplicates and handling missing values..."):
             cleaned_df, duplicates_removed, missing_cols = clean_data(df)
             st.session_state['cleaned_df'] = cleaned_df
 
@@ -193,7 +188,6 @@ with st.expander("🧹 Step 2: Data Cleaning", expanded=True):
                 st.dataframe(missing_cols.rename("Missing Count"))
             else:
                 st.info("No missing values were found.")
-
             st.dataframe(cleaned_df.head())
     else:
         cleaned_df = st.session_state.get('cleaned_df', None)
@@ -235,14 +229,12 @@ with st.expander("🔹 Step 4: K-Means Clustering", expanded=False):
 
         fig = px.scatter(
             x=X_pca[:,0], y=X_pca[:,1], color=labels.astype(str),
-            color_discrete_sequence=px.colors.sequential.Blues,
+            color_discrete_sequence=px.colors.qualitative.Pastel,
             title="K-Means Clusters (PCA 2D Visualization)",
             labels={'x':'PC1','y':'PC2'}
         )
         st.plotly_chart(fig, use_container_width=True)
         st.dataframe(pre_df['Cluster'].value_counts().rename_axis('Cluster').reset_index(name='Count'))
 
-# (Classification, Validation, Regression, Summary sections would follow unchanged)
-
 st.markdown("---")
-st.caption("💙 App built for thesis defense — includes new Data Cleaning stage for clarity and transparency.")
+st.caption("🩶 Clean & clear version for thesis defense — focuses on data visibility and simplicity.")
