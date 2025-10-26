@@ -28,6 +28,34 @@ from sklearn.metrics import (
 )
 from sklearn.metrics import silhouette_score
 
+# ================================================
+# MICROPLASTIC POLLUTION DATA CLEANING SCRIPT
+# Steps 2–7: Duplicates → Missing Values → Standardization →
+# Irrelevant Columns → Outliers → Text Normalization
+# (Integrated into the Streamlit app so users can apply these
+#  cleaning steps to an uploaded dataset interactively.)
+# ================================================
+
+# We'll attempt to import NLTK resources; if unavailable we fallback to lighter text cleaning.
+try:
+    import nltk
+    from nltk.corpus import stopwords
+    from nltk.stem import WordNetLemmatizer
+
+    # Attempt to download required resources if not present.
+    try:
+        nltk.data.find('corpora/stopwords')
+    except Exception:
+        nltk.download('stopwords', quiet=True)
+
+    try:
+        nltk.data.find('corpora/wordnet')
+    except Exception:
+        nltk.download('wordnet', quiet=True)
+    NLTK_AVAILABLE = True
+except Exception:
+    NLTK_AVAILABLE = False
+
 # -------------------------
 # App configuration & style
 # -------------------------
@@ -217,6 +245,115 @@ def has_nan_or_inf(arr) -> bool:
     return np.isnan(arr).any() or np.isinf(arr).any()
 
 # -------------------------
+# Additional cleaning helpers (from the requested script)
+# -------------------------
+def _col_map(df: pd.DataFrame) -> Dict[str, str]:
+    """Return mapping of lowercase cleaned column name -> actual column name in df"""
+    return {c.lower(): c for c in df.columns}
+
+def remove_duplicates(df: pd.DataFrame) -> pd.DataFrame:
+    return df.drop_duplicates().reset_index(drop=True)
+
+def handle_missing_values(df: pd.DataFrame) -> pd.DataFrame:
+    df_out = df.copy()
+    cmap = _col_map(df_out)
+    # Replace missing categorical values with 'Unknown'
+    categorical_cols = ['Location', 'Polymer_Type', 'Risk_Level']
+    for col in categorical_cols:
+        col_l = col.lower()
+        if col_l in cmap:
+            df_out[cmap[col_l]] = df_out[cmap[col_l]].fillna('Unknown')
+    # Replace missing numerical values with column mean
+    numeric_cols = ['MP_Count']
+    for col in numeric_cols:
+        col_l = col.lower()
+        if col_l in cmap:
+            try:
+                df_out[cmap[col_l]] = pd.to_numeric(df_out[cmap[col_l]], errors='coerce')
+                if df_out[cmap[col_l]].isnull().any():
+                    mean_val = df_out[cmap[col_l]].mean(skipna=True)
+                    df_out[cmap[col_l]].fillna(mean_val, inplace=True)
+            except Exception:
+                pass
+    return df_out
+
+def standardize_units_and_text(df: pd.DataFrame) -> pd.DataFrame:
+    df_out = df.copy()
+    cmap = _col_map(df_out)
+    # Convert risk levels to consistent capitalization
+    if 'risk_level' in cmap:
+        df_out[cmap['risk_level']] = df_out[cmap['risk_level']].astype(str).str.capitalize()
+    # Example of unit standardization (if MP_Count in particles/m3) -> particles/L (divide by 1000)
+    if 'mp_count' in cmap:
+        try:
+            df_out[cmap['mp_count']] = pd.to_numeric(df_out[cmap['mp_count']], errors='coerce')
+            df_out[cmap['mp_count']] = df_out[cmap['mp_count']] / 1000.0
+        except Exception:
+            pass
+    return df_out
+
+def remove_irrelevant_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df_out = df.copy()
+    cols_to_drop = ['Author', 'URL', 'Citation', 'Notes']
+    cmap = _col_map(df_out)
+    to_drop = [cmap[c.lower()] for c in cols_to_drop if c.lower() in cmap]
+    if to_drop:
+        df_out = df_out.drop(columns=to_drop, errors='ignore')
+    return df_out
+
+def detect_and_remove_outliers(df: pd.DataFrame) -> pd.DataFrame:
+    df_out = df.copy()
+    cmap = _col_map(df_out)
+    if 'mp_count' in cmap:
+        col = cmap['mp_count']
+        try:
+            series = pd.to_numeric(df_out[col], errors='coerce').dropna()
+            if series.empty:
+                return df_out
+            q1 = series.quantile(0.25)
+            q3 = series.quantile(0.75)
+            iqr = q3 - q1
+            lower_bound = q1 - 1.5 * iqr
+            upper_bound = q3 + 1.5 * iqr
+            mask = (pd.to_numeric(df_out[col], errors='coerce') >= lower_bound) & (pd.to_numeric(df_out[col], errors='coerce') <= upper_bound)
+            df_out = df_out.loc[mask.fillna(False)].reset_index(drop=True)
+        except Exception:
+            pass
+    return df_out
+
+def normalize_and_clean_text(df: pd.DataFrame) -> pd.DataFrame:
+    df_out = df.copy()
+    cmap = _col_map(df_out)
+    text_col = None
+    # look for common names for risk description
+    for candidate in ['risk_description', 'risk_description_text', 'description', 'notes', 'risk_notes']:
+        if candidate in cmap:
+            text_col = cmap[candidate]
+            break
+    # define cleaner
+    if text_col is not None:
+        if NLTK_AVAILABLE:
+            lemmatizer = WordNetLemmatizer()
+            stop_words = set(stopwords.words('english'))
+            def clean_text_nltk(text):
+                if pd.isnull(text):
+                    return ""
+                text_proc = re.sub(r'[^a-zA-Z\s]', '', str(text).lower())
+                words = [lemmatizer.lemmatize(w) for w in text_proc.split() if w not in stop_words]
+                return " ".join(words)
+            df_out['Cleaned_Text'] = df_out[text_col].apply(clean_text_nltk)
+        else:
+            # Lightweight fallback
+            def clean_text_simple(text):
+                if pd.isnull(text):
+                    return ""
+                text_proc = re.sub(r'[^a-zA-Z\s]', '', str(text).lower())
+                words = [w for w in text_proc.split() if len(w) > 2]
+                return " ".join(words)
+            df_out['Cleaned_Text'] = df_out[text_col].apply(clean_text_simple)
+    return df_out
+
+# -------------------------
 # Sidebar: structured into expanders for clarity
 # -------------------------
 with st.sidebar.expander("1) Dataset & Preview", expanded=True):
@@ -242,17 +379,64 @@ df_raw = clean_column_names(df_raw)
 with st.expander("Data preview (first 50 rows)", expanded=True):
     st.dataframe(df_raw.head(50))
 
-# Parse MP count candidate
-mp_count_candidates = [c for c in df_raw.columns if "mp_count" in c.lower() or "count" in c.lower() or "items" in c.lower()]
-mp_count_col = None
-with st.sidebar.expander("MP Count parsing options", expanded=False):
-    if mp_count_candidates:
-        mp_count_col = st.selectbox("Column to parse as numeric MP count (optional)", [""] + mp_count_candidates)
+# Provide the integrated cleaning script UI (Steps 2-7)
+with st.sidebar.expander("DATA CLEANING: Steps 2–7 (Duplicates → Missing → ...)", expanded=False):
+    st.write("Apply the standard microplastic cleaning pipeline to the uploaded dataset.")
+    st.write("- Removes duplicates\n- Handles missing values\n- Standardizes units/text\n- Drops irrelevant metadata columns\n- Detects & removes outliers (MP count)\n- Normalizes and cleans text columns (requires NLTK)")
+    run_cleaning = st.button("Run cleaning steps 2–7 on uploaded data")
+    allow_overwrite = st.checkbox("Replace current dataframe with cleaned result after running", value=True)
+    save_clean_csv = st.checkbox("Offer cleaned CSV for download", value=True)
+
+if 'cleaned_on_click' not in st.session_state:
+    st.session_state['cleaned_on_click'] = False
+
+if run_cleaning or st.session_state['cleaned_on_click']:
+    # make sure we only run once per click/refresh unless the user presses again
+    st.session_state['cleaned_on_click'] = True
+    st.info("Running cleaning steps 2–7 on the uploaded dataset (this will operate on the uploaded file copy).")
+    df_clean = df_raw.copy()
+    before_shape = df_clean.shape
+    # STEP 2: Remove duplicates
+    df_clean = remove_duplicates(df_clean)
+    st.write(f"Removed duplicates: {before_shape} -> {df_clean.shape}")
+    # STEP 3: Handle Missing Values
+    df_clean = handle_missing_values(df_clean)
+    st.write("Handled missing values (categorical -> 'Unknown', numeric -> mean where applicable).")
+    # STEP 4: Standardize Units and Text
+    df_clean = standardize_units_and_text(df_clean)
+    st.write("Standardized units/text (e.g., risk level capitalization, MP_Count unit transformation if present).")
+    # STEP 5: Remove Irrelevant Columns
+    df_clean = remove_irrelevant_columns(df_clean)
+    st.write("Removed irrelevant metadata columns if present (Author/URL/Citation/Notes).")
+    # STEP 6: Detect and Remove Outliers
+    before_outlier_shape = df_clean.shape
+    df_clean = detect_and_remove_outliers(df_clean)
+    st.write(f"Outlier removal (MP_Count IQR method): {before_outlier_shape} -> {df_clean.shape}")
+    # STEP 7: Normalize and Clean Text Columns
+    df_clean = normalize_and_clean_text(df_clean)
+    st.write("Normalized and cleaned text columns; created 'Cleaned_Text' when a text column was found.")
+    st.subheader("Cleaning summary")
+    st.write(f"Initial shape: {df_raw.shape}, After cleaning: {df_clean.shape}")
+    st.dataframe(df_clean.head(50))
+
+    if save_clean_csv:
+        try:
+            csv_bytes = df_clean.to_csv(index=False).encode('utf-8')
+            st.download_button("Download cleaned CSV", data=csv_bytes, file_name="microplastic_cleaned_data.csv", mime="text/csv")
+        except Exception as e:
+            st.warning(f"Could not prepare download: {e}")
+
+    if allow_overwrite:
+        # Overwrite df (the one used later in the app) with cleaned version
+        df = df_clean.copy().reset_index(drop=True)
+        st.success("Cleaned dataframe is now used for subsequent steps in the app.")
     else:
-        mp_count_col = st.selectbox("Column to parse as numeric MP count (optional)", [""] + df_raw.columns.tolist())
-    if mp_count_col:
-        df_raw["_MP_Count_parsed"] = df_raw[mp_count_col].apply(parse_mp_count)
-        st.sidebar.write(f"Parsed MP count saved to '_MP_Count_parsed' — non-null: {df_raw['_MP_Count_parsed'].notna().sum()}")
+        # Keep original df variable (defined later) untouched; store cleaned separately
+        st.session_state["df_cleaned_preview"] = df_clean.copy()
+        df = df_raw.copy()  # default downstream variable remains the original pre-cleaned version
+else:
+    # If user hasn't run cleaning, proceed with the original df_raw
+    df = df_raw.copy().reset_index(drop=True)
 
 # -------------------------
 # Preprocessing controls (grouped)
@@ -283,12 +467,12 @@ with st.sidebar.expander("2) Preprocessing", expanded=False):
 
 # Apply preprocessing
 if drop_na:
-    before_rows = df_raw.shape[0]
-    df = df_raw.dropna(axis=0, how="any").reset_index(drop=True)
+    before_rows = df.shape[0]
+    df = df.dropna(axis=0, how="any").reset_index(drop=True)
     after_rows = df.shape[0]
     st.info(f"Dropped rows with missing values: {before_rows} -> {after_rows}")
 else:
-    df = df_raw.copy().reset_index(drop=True)
+    df = df.copy().reset_index(drop=True)
     df = impute_numeric_columns(df, impute_strategy)
     df = impute_categorical_columns(df)
     remaining_na = df.isna().sum()
