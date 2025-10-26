@@ -1,5 +1,0 @@
-{
-  "name": "Microplastic Pollution Risk Assessment System",
-  "description": "An interactive web application that leverages generative AI to analyze environmental data, predict microplastic pollution risk levels, and generate comprehensive reports. Users can upload datasets, explore data through visualizations, and simulate risk predictions using advanced AI models.",
-  "requestFramePermissions": []
-}
