@@ -382,7 +382,7 @@ with st.expander("Data preview (first 50 rows)", expanded=True):
 # Provide the integrated cleaning script UI (Steps 2-7)
 with st.sidebar.expander("DATA CLEANING: Steps 2–7 (Duplicates → Missing → ...)", expanded=False):
     st.write("Apply the standard microplastic cleaning pipeline to the uploaded dataset.")
-    st.write("- Removes duplicates\n- Handles missing values\n- Standardizes units/text\n- Drops irrelevant metadata columns\n- Detects & removes outliers (MP count)\n- Normalizes and cleans text columns (requires NLTK)")
+    st.write("- Removes duplicates\n- Handles missing values\n- Standardizes units/text\n- Drops irrelevant metadata columns\n- Detects & removes outliers (MP count)\n- Normalizes and cleans text colu[...]
     run_cleaning = st.button("Run cleaning steps 2–7 on uploaded data")
     allow_overwrite = st.checkbox("Replace current dataframe with cleaned result after running", value=True)
     save_clean_csv = st.checkbox("Offer cleaned CSV for download", value=True)
@@ -442,9 +442,8 @@ else:
 # Preprocessing controls (grouped)
 # -------------------------
 with st.sidebar.expander("2) Preprocessing", expanded=False):
-    st.write("Choose how to handle missing values and imputation.")
-    drop_na = st.checkbox("Drop rows with any missing values", value=False)
-    impute_strategy = st.selectbox("Numeric imputation strategy", ["mean", "median", "most_frequent"], index=0)
+    st.write("Missing-value handling is automatic: rows with any missing values will be dropped before training to ensure clean inputs.")
+    impute_strategy = st.selectbox("Numeric imputation strategy (used where needed during feature preparation)", ["mean", "median", "most_frequent"], index=0)
 
     def impute_numeric_columns(df_in: pd.DataFrame, strategy: str) -> pd.DataFrame:
         df_out = df_in.copy()
@@ -466,11 +465,14 @@ with st.sidebar.expander("2) Preprocessing", expanded=False):
         return df_out
 
 # Apply preprocessing
+# NOTE: the checkbox for dropping rows with missing values was removed per request;
+# dropping is now performed automatically to ensure deterministic behavior.
+drop_na = True
 if drop_na:
     before_rows = df.shape[0]
     df = df.dropna(axis=0, how="any").reset_index(drop=True)
     after_rows = df.shape[0]
-    st.info(f"Dropped rows with missing values: {before_rows} -> {after_rows}")
+    st.info(f"Automatically dropped rows with missing values: {before_rows} -> {after_rows}")
 else:
     df = df.copy().reset_index(drop=True)
     df = impute_numeric_columns(df, impute_strategy)
