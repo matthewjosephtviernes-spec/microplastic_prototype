@@ -1,4 +1,4 @@
-# app.py – Streamlit app aligned with "NewData - Copy.csv"
+# app.py – Final Version for "Predictive Risk Modeling for Microplastic Pollution"
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -9,34 +9,38 @@ from sklearn.cluster import KMeans
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.linear_model import LogisticRegression
 from sklearn.tree import DecisionTreeClassifier
-from sklearn.metrics import accuracy_score, confusion_matrix, classification_report, mean_squared_error, r2_score
+from sklearn.metrics import accuracy_score, classification_report, mean_squared_error, r2_score
 
-# ---------------------
-# Streamlit App Header
-# ---------------------
+# ---------------------------------
+# Streamlit Page Configuration
+# ---------------------------------
 st.set_page_config(page_title="Microplastic Risk Modeling", layout="wide")
 st.title("🌊 Predictive Risk Modeling for Microplastic Pollution")
-st.markdown("### Upload your dataset (.csv) aligned with your microplastic research")
+st.markdown("#### Upload your dataset to begin the analysis")
 
-# ---------------------
+# ---------------------------------
 # File Upload Section
-# ---------------------
-uploaded_file = st.file_uploader("Upload CSV file", type=["csv"])
+# ---------------------------------
+uploaded_file = st.file_uploader("📂 Upload your CSV file", type=["csv"])
 
 if uploaded_file:
-    df = pd.read_csv(uploaded_file, encoding="latin1")
+    # Try reading the file safely
+    try:
+        df = pd.read_csv(uploaded_file, encoding='latin1')
+    except UnicodeDecodeError:
+        df = pd.read_csv(uploaded_file, encoding='utf-8', errors='ignore')
 
-    # ---------------------
-    # Data Cleaning
-    # ---------------------
+    # ---------------------------------
+    # Data Cleaning & Preparation
+    # ---------------------------------
     df.columns = df.columns.str.strip().str.replace(" ", "_")
     df = df.dropna(how="all")
 
-    # Drop irrelevant column
+    # Drop unnecessary column
     if "Author" in df.columns:
         df = df.drop(columns=["Author"])
 
-    # Convert numeric-like columns
+    # Numeric extraction for columns with ranges (e.g., “0.5–1.0”, “8 33 ppt”)
     def extract_numeric(val):
         if isinstance(val, str):
             val = val.replace("ppt", "").replace("–", "-").replace("to", "-")
@@ -48,26 +52,24 @@ if uploaded_file:
                 return np.nan
         return val
 
-    # Apply cleaning
     for col in ["Salinity", "Density", "Microplastic_Size"]:
         if col in df.columns:
             df[col] = df[col].apply(extract_numeric)
 
-    # Convert Risk_Score to float
     if "Risk_Score" in df.columns:
         df["Risk_Score"] = pd.to_numeric(df["Risk_Score"], errors="coerce")
 
-    # ---------------------
-    # Display Basic Info
-    # ---------------------
+    # ---------------------------------
+    # Display Dataset Overview
+    # ---------------------------------
     st.subheader("📊 Dataset Preview")
-    st.dataframe(df.head(10))
-    st.write("Shape:", df.shape)
-    st.write("Columns:", list(df.columns))
+    st.dataframe(df.head(10), use_container_width=True)
+    st.write(f"**Shape:** {df.shape}")
+    st.write(f"**Columns:** {list(df.columns)}")
 
-    # ---------------------
-    # Feature Encoding
-    # ---------------------
+    # ---------------------------------
+    # Encode Categorical Columns
+    # ---------------------------------
     st.subheader("🧩 Data Preprocessing")
     cat_cols = df.select_dtypes(include=["object"]).columns
     le = LabelEncoder()
@@ -77,9 +79,9 @@ if uploaded_file:
 
     st.success("Categorical columns encoded successfully!")
 
-    # ---------------------
+    # ---------------------------------
     # Clustering Section
-    # ---------------------
+    # ---------------------------------
     st.subheader("🔶 K-Means Clustering")
     num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     selected_features = st.multiselect("Select features for clustering", num_cols, default=["Latitude", "Longitude", "MP_Count_per_L", "Risk_Score"])
@@ -89,15 +91,20 @@ if uploaded_file:
         kmeans = KMeans(n_clusters=k, random_state=42)
         df["Cluster"] = kmeans.fit_predict(df[selected_features])
 
-        fig = px.scatter_3d(df, x=selected_features[0], y=selected_features[1],
+        fig = px.scatter_3d(df, 
+                            x=selected_features[0], 
+                            y=selected_features[1],
                             z=selected_features[2] if len(selected_features) > 2 else selected_features[1],
-                            color="Cluster", title="3D Cluster Visualization", height=600)
+                            color="Cluster", 
+                            title="3D Cluster Visualization",
+                            height=600)
         st.plotly_chart(fig, use_container_width=True)
 
-    # ---------------------
+    # ---------------------------------
     # Classification Section
-    # ---------------------
+    # ---------------------------------
     st.subheader("🧠 Risk Level Classification")
+
     if "Risk_Level" in df.columns:
         target_col = "Risk_Level"
         features = [col for col in df.columns if col not in [target_col, "Risk_Score", "Cluster"]]
@@ -107,6 +114,7 @@ if uploaded_file:
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
 
         model_choice = st.selectbox("Select Classification Model", ["Random Forest", "Logistic Regression", "Decision Tree"])
+
         if model_choice == "Random Forest":
             model = RandomForestClassifier(random_state=42)
         elif model_choice == "Logistic Regression":
@@ -121,13 +129,31 @@ if uploaded_file:
         st.write(f"**Accuracy:** {acc:.2f}")
         st.text("Classification Report:")
         st.text(classification_report(y_test, preds))
+
+        # Feature importance visualization (for tree-based models)
+        if model_choice in ["Random Forest", "Decision Tree"]:
+            importances = model.feature_importances_
+            feat_imp_df = pd.DataFrame({
+                "Feature": features,
+                "Importance": importances
+            }).sort_values(by="Importance", ascending=False)
+
+            st.subheader("📈 Feature Importance (Classification)")
+            fig_imp = px.bar(feat_imp_df.head(10), 
+                             x="Importance", 
+                             y="Feature", 
+                             orientation="h", 
+                             title="Top 10 Important Features for Risk_Level",
+                             height=400)
+            st.plotly_chart(fig_imp, use_container_width=True)
     else:
         st.warning("No 'Risk_Level' column found for classification.")
 
-    # ---------------------
+    # ---------------------------------
     # Regression Section
-    # ---------------------
-    st.subheader("📈 Risk Score Regression")
+    # ---------------------------------
+    st.subheader("📉 Risk Score Regression")
+
     if "Risk_Score" in df.columns:
         target = "Risk_Score"
         features = [col for col in df.columns if col not in [target, "Risk_Level", "Cluster"]]
@@ -147,16 +173,12 @@ if uploaded_file:
 
         results_df = pd.DataFrame({"Actual": y_test, "Predicted": preds})
         st.dataframe(results_df.head(10))
-        fig2 = px.scatter(results_df, x="Actual", y="Predicted", trendline="ols", title="Actual vs Predicted Risk Score")
+
+        fig2 = px.scatter(results_df, 
+                          x="Actual", 
+                          y="Predicted", 
+                          trendline="ols", 
+                          title="Actual vs Predicted Risk Score")
         st.plotly_chart(fig2, use_container_width=True)
-    else:
-        st.warning("No 'Risk_Score' column found for regression.")
 
-else:
-    st.info("Please upload a CSV file to begin.")
-
-# ---------------------
-# Footer
-# ---------------------
-st.markdown("---")
-st.caption("Developed for the research project: *Predictive Risk Modeling for Microplastic Pollution Using Data Mining Techniques* 🌍")
+        # Featu
