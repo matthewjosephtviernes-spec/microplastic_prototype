@@ -1,184 +1,594 @@
-# app.py – Final Version for "Predictive Risk Modeling for Microplastic Pollution"
-import streamlit as st
-import pandas as pd
+"""
+app.py
+
+Predictive Risk Modeling Framework for Microplastic Pollution
+with visualizations at every major processing step.
+
+- Loads MicroPlastic.csv
+- Preprocesses data (missing values, outlier handling, skewness correction, encoding, scaling, splitting)
+- Visualizes:
+    * Missing data heatmap
+    * Outliers (boxplots before/after) for specified numeric columns
+    * Skewness (histograms / KDE before & after log1p)
+    * Categorical distributions before encoding
+    * Scaled numerical feature distributions
+- Trains three classification models:
+    * Logistic Regression
+    * Random Forest Classifier
+    * Gradient Boosting Classifier
+- Visualizes:
+    * Model coefficient/importances
+    * Confusion matrices
+    * Metrics comparison bar chart
+    * Cross-validation accuracy boxplots
+- Evaluates models (accuracy, precision, recall, f1)
+- Modular, documented, research-friendly
+
+Usage:
+    python app.py
+
+Requirements:
+    pandas, numpy, scikit-learn, matplotlib, seaborn
+"""
+
+import os
+import sys
+import warnings
+from typing import Dict, Tuple, List
+
 import numpy as np
-import plotly.express as px
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.model_selection import train_test_split
-from sklearn.cluster import KMeans
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+import pandas as pd
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
 from sklearn.linear_model import LogisticRegression
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.metrics import accuracy_score, classification_report, mean_squared_error, r2_score
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    classification_report,
+    confusion_matrix,
+)
 
-# ---------------------------------
-# Streamlit Page Configuration
-# ---------------------------------
-st.set_page_config(page_title="Microplastic Risk Modeling", layout="wide")
-st.title("🌊 Predictive Risk Modeling for Microplastic Pollution")
-st.markdown("#### Upload your dataset to begin the analysis")
+warnings.filterwarnings("ignore")
+RANDOM_STATE = 42
 
-# ---------------------------------
-# File Upload Section
-# ---------------------------------
-uploaded_file = st.file_uploader("📂 Upload your CSV file", type=["csv"])
+# Output directory for saved plots
+OUTPUT_DIR = "outputs"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+sns.set(style="whitegrid")
 
-if uploaded_file:
-    # Try reading the file safely
+
+# ----------------------------
+# Helper plotting functions
+# ----------------------------
+def save_and_show(fig, filename: str, dpi: int = 150, tight: bool = True, show: bool = False):
+    """Save figure to outputs directory and optionally show it."""
+    path = os.path.join(OUTPUT_DIR, filename)
+    if tight:
+        fig.tight_layout()
+    fig.savefig(path, dpi=dpi)
+    if show:
+        plt.show()
+    plt.close(fig)
+    print(f"   -> Plot saved to {path}")
+
+
+def plot_missing_values_heatmap(df: pd.DataFrame, fname: str = "missing_heatmap.png"):
+    """Plot heatmap of missing values (boolean)."""
+    fig, ax = plt.subplots(figsize=(10, max(4, len(df.columns) * 0.2)))
+    sns.heatmap(df.isnull(), cbar=False, yticklabels=False, ax=ax)
+    ax.set_title("Missing Values Heatmap (True = missing)")
+    save_and_show(fig, fname)
+
+
+def plot_boxplot_before_after(before: pd.DataFrame, after: pd.DataFrame, cols: List[str], prefix: str = "outlier"):
+    """
+    Plot boxplots before and after for columns in 'cols'. Saves one figure per column.
+    """
+    for col in cols:
+        if col not in before.columns or col not in after.columns:
+            continue
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+        sns.boxplot(x=before[col], ax=axes[0], color="skyblue")
+        axes[0].set_title(f"{col} (Before)")
+        sns.boxplot(x=after[col], ax=axes[1], color="lightgreen")
+        axes[1].set_title(f"{col} (After - capped)")
+        fig.suptitle(f"Outlier handling (IQR cap) for {col}")
+        save_and_show(fig, f"{prefix}_boxplot_{col}.png")
+
+
+def plot_histogram_comparison(df_before: pd.DataFrame, df_after: pd.DataFrame, cols: List[str], prefix: str = "skew"):
+    """
+    For each column, plot histogram/KDE before and after transformation (log1p).
+    """
+    for col in cols:
+        if col not in df_before.columns or col not in df_after.columns:
+            continue
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+        sns.histplot(df_before[col].dropna(), kde=True, ax=axes[0], color="cornflowerblue")
+        axes[0].set_title(f"{col} BEFORE transformation\nskew={df_before[col].skew():.3f}")
+        sns.histplot(df_after[col].dropna(), kde=True, ax=axes[1], color="seagreen")
+        axes[1].set_title(f"{col} AFTER transformation\nskew={df_after[col].skew():.3f}")
+        fig.suptitle(f"Skewness correction for {col}")
+        save_and_show(fig, f"{prefix}_hist_{col}.png")
+
+
+def plot_categorical_counts(df: pd.DataFrame, cols: List[str], top_n: int = 10, prefix: str = "cat_counts"):
+    """
+    Plot bar charts of categorical counts for the provided columns (before encoding).
+    """
+    for col in cols:
+        if col not in df.columns:
+            continue
+        vc = df[col].astype(str).value_counts().nlargest(top_n)
+        fig, ax = plt.subplots(figsize=(8, 4))
+        sns.barplot(x=vc.values, y=vc.index, palette="viridis", ax=ax)
+        ax.set_xlabel("Count")
+        ax.set_ylabel(col)
+        ax.set_title(f"Top {len(vc)} value counts for {col}")
+        save_and_show(fig, f"{prefix}_{col}.png")
+
+
+def plot_scaled_feature_distributions(X_scaled: pd.DataFrame, prefix: str = "scaled"):
+    """Plot histograms for scaled numerical features (first up to 12 features)."""
+    cols = X_scaled.columns.tolist()
+    n = min(len(cols), 12)
+    sample_cols = cols[:n]
+    fig, axes = plt.subplots(nrows=n, ncols=1, figsize=(8, 2 * n))
+    if n == 1:
+        axes = [axes]
+    for ax, col in zip(axes, sample_cols):
+        sns.histplot(X_scaled[col], kde=True, ax=ax, color="orchid")
+        ax.set_title(f"Scaled Distribution: {col}")
+    fig.suptitle("Scaled numerical feature distributions (sample)")
+    save_and_show(fig, f"{prefix}_feature_dists_sample.png")
+
+
+def plot_feature_importances(model, feature_names: List[str], name: str, top_n: int = 10):
+    """
+    Plot top_n feature importances.
+    Supports tree-based models with feature_importances_ and linear models with coef_.
+    """
+    importances = None
+    title = ""
+    if hasattr(model, "feature_importances_"):
+        importances = model.feature_importances_
+        title = f"{name} Feature Importances"
+    elif hasattr(model, "coef_"):
+        # For logistic regression, take mean absolute coefficient across classes
+        coef = model.coef_
+        if coef.ndim == 1:
+            importances = np.abs(coef)
+        else:
+            importances = np.mean(np.abs(coef), axis=0)
+        title = f"{name} Coefficient magnitudes (mean abs)"
+    else:
+        print(f"   -> No importances/coefficients available for {name}")
+        return
+
+    fi = pd.Series(importances, index=feature_names).sort_values(ascending=False).head(top_n)
+    fig, ax = plt.subplots(figsize=(8, max(4, top_n * 0.4)))
+    sns.barplot(x=fi.values, y=fi.index, ax=ax, palette="magma")
+    ax.set_title(title)
+    ax.set_xlabel("Importance / |Coefficient|")
+    save_and_show(fig, f"feature_importances_{name}.png")
+
+
+def plot_confusion_matrix_heatmap(y_true, y_pred, classes: List[str], name: str):
+    """Plot confusion matrix heatmap and save."""
+    cm = confusion_matrix(y_true, y_pred)
+    fig, ax = plt.subplots(figsize=(6, 5))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax)
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("Actual")
+    ax.set_title(f"Confusion Matrix: {name}")
+    if classes is not None:
+        ax.set_xticklabels(classes, rotation=45, ha="right")
+        ax.set_yticklabels(classes, rotation=0)
+    save_and_show(fig, f"confusion_matrix_{name}.png")
+
+
+def plot_metrics_comparison(metrics_dict: Dict[str, Dict[str, float]], prefix: str = "metrics"):
+    """Plot bar chart comparing accuracy/precision/recall/f1 across models."""
+    df = pd.DataFrame(metrics_dict).T  # models x metrics
+    metrics = ["accuracy", "precision", "recall", "f1"]
+    df = df[metrics]
+    fig, ax = plt.subplots(figsize=(8, 5))
+    df.plot(kind="bar", ax=ax)
+    ax.set_ylim(0, 1)
+    ax.set_title("Model comparison on test set")
+    ax.set_ylabel("Score")
+    save_and_show(fig, f"{prefix}_comparison.png")
+
+
+def plot_cv_boxplot(cv_scores: Dict[str, np.ndarray], prefix: str = "cv"):
+    """Plot boxplots of cross-validation accuracies for each model."""
+    data = []
+    labels = []
+    for name, scores in cv_scores.items():
+        data.append(scores)
+        labels.append(name)
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.boxplot(data, labels=labels)
+    ax.set_title("Cross-validation accuracy distribution")
+    ax.set_ylabel("Accuracy")
+    save_and_show(fig, f"{prefix}_boxplot.png")
+
+
+# ----------------------------
+# Core processing functions
+# ----------------------------
+def load_and_preprocess_data(csv_path: str = "MicroPlastic.csv") -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, Dict]:
+    """
+    Load dataset and perform preprocessing with visualizations at each step.
+
+    Returns:
+      X_train, X_test, y_train, y_test, meta_info
+    """
+    print("\n[1] Loading dataset...")
+    if not os.path.exists(csv_path):
+        print(f"ERROR: {csv_path} not found in {os.getcwd()}. Exiting.")
+        sys.exit(1)
+
+    df = pd.read_csv(csv_path)
+    print(f" - Loaded dataset with shape: {df.shape}")
+
+    # Visualize missing values
+    print("\n[2] Visualizing missing values...")
     try:
-        df = pd.read_csv(uploaded_file, encoding='latin1')
-    except UnicodeDecodeError:
-        df = pd.read_csv(uploaded_file, encoding='utf-8', errors='ignore')
+        plot_missing_values_heatmap(df, fname="missing_heatmap.png")
+    except Exception as e:
+        print(f"   -> Could not plot missing heatmap: {e}")
 
-    # ---------------------------------
-    # Data Cleaning & Preparation
-    # ---------------------------------
-    df.columns = df.columns.str.strip().str.replace(" ", "_")
-    df = df.dropna(how="all")
-
-    # Drop unnecessary column
-    if "Author" in df.columns:
-        df = df.drop(columns=["Author"])
-
-    # Numeric extraction for columns with ranges (e.g., “0.5–1.0”, “8 33 ppt”)
-    def extract_numeric(val):
-        if isinstance(val, str):
-            val = val.replace("ppt", "").replace("–", "-").replace("to", "-")
-            parts = val.split("-")
-            try:
-                nums = [float(p.strip()) for p in parts if p.strip() != ""]
-                return np.mean(nums)
-            except:
-                return np.nan
-        return val
-
-    for col in ["Salinity", "Density", "Microplastic_Size"]:
-        if col in df.columns:
-            df[col] = df[col].apply(extract_numeric)
-
-    if "Risk_Score" in df.columns:
-        df["Risk_Score"] = pd.to_numeric(df["Risk_Score"], errors="coerce")
-
-    # ---------------------------------
-    # Display Dataset Overview
-    # ---------------------------------
-    st.subheader("📊 Dataset Preview")
-    st.dataframe(df.head(10), use_container_width=True)
-    st.write(f"**Shape:** {df.shape}")
-    st.write(f"**Columns:** {list(df.columns)}")
-
-    # ---------------------------------
-    # Encode Categorical Columns
-    # ---------------------------------
-    st.subheader("🧩 Data Preprocessing")
-    cat_cols = df.select_dtypes(include=["object"]).columns
-    le = LabelEncoder()
-    for col in cat_cols:
-        df[col] = df[col].astype(str)
-        df[col] = le.fit_transform(df[col])
-
-    st.success("Categorical columns encoded successfully!")
-
-    # ---------------------------------
-    # Clustering Section
-    # ---------------------------------
-    st.subheader("🔶 K-Means Clustering")
-    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    selected_features = st.multiselect("Select features for clustering", num_cols, default=["Latitude", "Longitude", "MP_Count_per_L", "Risk_Score"])
-
-    if len(selected_features) >= 2:
-        k = st.slider("Select number of clusters (k)", 2, 10, 3)
-        kmeans = KMeans(n_clusters=k, random_state=42)
-        df["Cluster"] = kmeans.fit_predict(df[selected_features])
-
-        fig = px.scatter_3d(df, 
-                            x=selected_features[0], 
-                            y=selected_features[1],
-                            z=selected_features[2] if len(selected_features) > 2 else selected_features[1],
-                            color="Cluster", 
-                            title="3D Cluster Visualization",
-                            height=600)
-        st.plotly_chart(fig, use_container_width=True)
-
-    # ---------------------------------
-    # Classification Section
-    # ---------------------------------
-    st.subheader("🧠 Risk Level Classification")
-
+    # Determine target column
     if "Risk_Level" in df.columns:
         target_col = "Risk_Level"
-        features = [col for col in df.columns if col not in [target_col, "Risk_Score", "Cluster"]]
-        X = df[features]
-        y = df[target_col]
-
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
-
-        model_choice = st.selectbox("Select Classification Model", ["Random Forest", "Logistic Regression", "Decision Tree"])
-
-        if model_choice == "Random Forest":
-            model = RandomForestClassifier(random_state=42)
-        elif model_choice == "Logistic Regression":
-            model = LogisticRegression(max_iter=500)
-        else:
-            model = DecisionTreeClassifier(random_state=42)
-
-        model.fit(X_train, y_train)
-        preds = model.predict(X_test)
-        acc = accuracy_score(y_test, preds)
-
-        st.write(f"**Accuracy:** {acc:.2f}")
-        st.text("Classification Report:")
-        st.text(classification_report(y_test, preds))
-
-        # Feature importance visualization (for tree-based models)
-        if model_choice in ["Random Forest", "Decision Tree"]:
-            importances = model.feature_importances_
-            feat_imp_df = pd.DataFrame({
-                "Feature": features,
-                "Importance": importances
-            }).sort_values(by="Importance", ascending=False)
-
-            st.subheader("📈 Feature Importance (Classification)")
-            fig_imp = px.bar(feat_imp_df.head(10), 
-                             x="Importance", 
-                             y="Feature", 
-                             orientation="h", 
-                             title="Top 10 Important Features for Risk_Level",
-                             height=400)
-            st.plotly_chart(fig_imp, use_container_width=True)
+        print(" - Using 'Risk_Level' as the target variable.")
+    elif "Risk_Type" in df.columns:
+        target_col = "Risk_Type"
+        print(" - Using 'Risk_Type' as the target variable.")
     else:
-        st.warning("No 'Risk_Level' column found for classification.")
+        target_col = df.columns[-1]
+        print(f" - Falling back to last column as target: '{target_col}'.")
 
-    # ---------------------------------
-    # Regression Section
-    # ---------------------------------
-    st.subheader("📉 Risk Score Regression")
+    # Keep copy before modifications for plots
+    df_before_outliers = df.copy()
 
-    if "Risk_Score" in df.columns:
-        target = "Risk_Score"
-        features = [col for col in df.columns if col not in [target, "Risk_Level", "Cluster"]]
-        X = df[features]
-        y = df[target]
+    # Handle missing values
+    print("\n[3] Handling missing values...")
+    num_cols_all = df.select_dtypes(include=[np.number]).columns.tolist()
+    cat_cols_all = df.select_dtypes(include=["object", "category"]).columns.tolist()
+    print(f" - Numerical columns detected: {num_cols_all}")
+    print(f" - Categorical columns detected: {cat_cols_all}")
 
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
+    for c in num_cols_all:
+        df[c] = df[c].fillna(df[c].median())
+    for c in cat_cols_all:
+        df[c] = df[c].fillna("Missing")
 
-        reg = RandomForestRegressor(random_state=42)
-        reg.fit(X_train, y_train)
-        preds = reg.predict(X_test)
+    print("   -> Filled numeric with median and categorical with 'Missing'.")
 
-        mse = mean_squared_error(y_test, preds)
-        r2 = r2_score(y_test, preds)
-        st.write(f"**Mean Squared Error:** {mse:.3f}")
-        st.write(f"**R² Score:** {r2:.3f}")
+    # OUTLIER HANDLING using IQR for specified columns
+    outlier_cols = [
+        "MP_Count_per_L",
+        "Risk_Score",
+        "Microplastic_Size_mm_midpoint",
+        "Density_midpoint",
+    ]
+    print("\n[4] Outlier detection & handling (IQR capping) on specific columns:")
+    outlier_cols_present = [c for c in outlier_cols if c in df.columns and pd.api.types.is_numeric_dtype(df[c])]
+    if not outlier_cols_present:
+        print("   -> None of the specified outlier columns were present and numeric. Skipping outlier visuals.")
+    else:
+        print(f"   -> Columns to process for outliers: {outlier_cols_present}")
 
-        results_df = pd.DataFrame({"Actual": y_test, "Predicted": preds})
-        st.dataframe(results_df.head(10))
+    # Create a before-capping snapshot for plotting
+    df_snapshot_before = df.copy()
 
-        fig2 = px.scatter(results_df, 
-                          x="Actual", 
-                          y="Predicted", 
-                          trendline="ols", 
-                          title="Actual vs Predicted Risk Score")
-        st.plotly_chart(fig2, use_container_width=True)
+    # Cap extremes
+    for col in outlier_cols_present:
+        q1 = df[col].quantile(0.25)
+        q3 = df[col].quantile(0.75)
+        iqr = q3 - q1
+        lower = q1 - 1.5 * iqr
+        upper = q3 + 1.5 * iqr
+        n_low = (df[col] < lower).sum()
+        n_high = (df[col] > upper).sum()
+        print(f"    - {col}: IQR bounds ({lower:.4g}, {upper:.4g}), below={n_low}, above={n_high}")
+        df[col] = np.where(df[col] < lower, lower, df[col])
+        df[col] = np.where(df[col] > upper, upper, df[col])
+    # Plot boxplots before/after
+    try:
+        plot_boxplot_before_after(df_snapshot_before, df, outlier_cols_present, prefix="outlier")
+    except Exception as e:
+        print(f"   -> Could not plot outlier boxplots: {e}")
 
-        # Featu
+    # SKNEWNESS ANALYSIS
+    print("\n[5] Skewness analysis and log1p transformation for skewed numeric columns:")
+    # Recompute numeric columns and avoid transforming target
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if target_col in numeric_cols:
+        numeric_cols.remove(target_col)
+
+    skew_info = {}
+    for col in numeric_cols:
+        skew_val = float(df[col].skew())
+        skew_info[col] = skew_val
+    print(" - Skewness BEFORE transformation (sample):")
+    for k, v in list(skew_info.items())[:10]:
+        print(f"    {k}: {v:.4f}")
+
+    skewed_cols = [c for c, s in skew_info.items() if abs(s) > 0.5]
+    print(f" - Columns identified as skewed (|skew| > 0.5): {skewed_cols}")
+
+    df_snapshot_before_skew = df.copy()
+    transforms_applied = {}
+    for col in skewed_cols:
+        col_min = df[col].min()
+        shift = 0.0
+        if col_min <= -1e-9:
+            shift = abs(col_min) + 1e-6
+            print(f"    -> Shifting {col} by {shift:.6g} before log1p due to negative min {col_min:.4g}")
+        df[col] = np.log1p(df[col] + shift)
+        transforms_applied[col] = {"shift": shift}
+
+    # Plot histogram comparisons for skewed columns
+    try:
+        plot_histogram_comparison(df_snapshot_before_skew, df, skewed_cols, prefix="skew")
+    except Exception as e:
+        print(f"   -> Could not plot skewness histograms: {e}")
+
+    # CATEGORICAL ENCODING
+    print("\n[6] Categorical encoding (specified columns):")
+    cols_to_encode = [
+        "Location",
+        "Shape",
+        "Polymer_Type",
+        "pH",
+        "Salinity",
+        "Industrial_Activity",
+        "Population_Density",
+        "Risk_Type",
+        "Risk_Level",
+        "Author",
+    ]
+    # Keep only those present
+    cols_to_encode_present = [c for c in cols_to_encode if c in df.columns]
+    print(f"   -> Columns present for encoding: {cols_to_encode_present}")
+
+    # Visualize categorical distributions BEFORE encoding
+    try:
+        plot_categorical_counts(df, cols_to_encode_present, top_n=8, prefix="cat_before_encoding")
+    except Exception as e:
+        print(f"   -> Could not plot categorical counts: {e}")
+
+    df_encoded = df.copy()
+    label_encoders = {}
+    onehot_columns = []
+
+    for col in cols_to_encode_present:
+        # Ensure string dtype for consistent encoding
+        df_encoded[col] = df_encoded[col].astype(str).fillna("Missing")
+        nunique = df_encoded[col].nunique()
+        if nunique <= 10:
+            dummies = pd.get_dummies(df_encoded[col], prefix=col, drop_first=True)
+            df_encoded = pd.concat([df_encoded.drop(columns=[col]), dummies], axis=1)
+            onehot_columns.extend(list(dummies.columns))
+            print(f"    - One-hot encoded {col} into {len(dummies.columns)} columns.")
+        else:
+            le = LabelEncoder()
+            df_encoded[col + "_LE"] = le.fit_transform(df_encoded[col])
+            label_encoders[col] = le
+            df_encoded = df_encoded.drop(columns=[col])
+            print(f"    - Label-encoded {col} into {col + '_LE'} (classes: {len(le.classes_)})")
+
+    # Prepare target variable
+    if target_col in df_encoded.columns:
+        y_raw = df_encoded[target_col]
+    else:
+        y_raw = df[target_col]
+    if y_raw.dtype == "O" or not pd.api.types.is_numeric_dtype(y_raw):
+        le_target = LabelEncoder()
+        y = pd.Series(le_target.fit_transform(y_raw.astype(str)), name=target_col)
+        label_encoders[target_col + "_target"] = le_target
+        print(f"   -> Target '{target_col}' label-encoded (classes: {list(le_target.classes_)})")
+    else:
+        y = pd.Series(y_raw, name=target_col)
+
+    # Remove target from features if still present
+    if target_col in df_encoded.columns:
+        X_df = df_encoded.drop(columns=[target_col])
+    else:
+        X_df = df_encoded.copy()
+
+    # Feature scaling of numeric features
+    numeric_features = X_df.select_dtypes(include=[np.number]).columns.tolist()
+    print(f"\n[7] Scaling numerical features (StandardScaler). Numeric features: {len(numeric_features)}")
+    scaler = StandardScaler()
+    if numeric_features:
+        X_numeric_scaled = pd.DataFrame(scaler.fit_transform(X_df[numeric_features]), columns=numeric_features, index=X_df.index)
+    else:
+        X_numeric_scaled = pd.DataFrame(index=X_df.index)
+
+    # Visualize scaled feature distributions (sample)
+    try:
+        plot_scaled_feature_distributions(X_numeric_scaled, prefix="scaled")
+    except Exception as e:
+        print(f"   -> Could not plot scaled feature distributions: {e}")
+
+    # Combine scaled numeric and any remaining non-numeric (should be none)
+    non_numeric = X_df.select_dtypes(exclude=[np.number]).columns.tolist()
+    if non_numeric:
+        print(f"   -> Note: non-numeric features still present (unexpected): {non_numeric}")
+        X_final = pd.concat([X_numeric_scaled, X_df[non_numeric].reset_index(drop=True)], axis=1)
+    else:
+        X_final = X_numeric_scaled
+
+    print(f" - Final feature matrix shape: {X_final.shape}; target shape: {y.shape}")
+
+    # Train-test split
+    print("\n[8] Splitting data into training and testing sets (80% train / 20% test)")
+    try:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X_final, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y
+        )
+    except Exception:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X_final, y, test_size=0.2, random_state=RANDOM_STATE, stratify=None
+        )
+        print("   -> Stratified split failed; used regular split.")
+
+    print(f" - X_train: {X_train.shape}, X_test: {X_test.shape}")
+    meta = {
+        "scaler": scaler,
+        "label_encoders": label_encoders,
+        "onehot_columns": onehot_columns,
+        "numeric_features": numeric_features,
+        "target_col": target_col,
+        "transforms_applied": transforms_applied,
+    }
+    return X_train, X_test, y_train, y_test, meta
+
+
+def train_models(X_train: pd.DataFrame, y_train: pd.Series) -> Dict[str, object]:
+    """
+    Train 3 classification models and return trained models.
+    Also saves simple textual model summaries and feature importance plots.
+    """
+    print("\n[9] Training models...")
+    models = {
+        "LogisticRegression": LogisticRegression(max_iter=1000, random_state=RANDOM_STATE),
+        "RandomForest": RandomForestClassifier(n_estimators=100, random_state=RANDOM_STATE),
+        "GradientBoosting": GradientBoostingClassifier(n_estimators=100, random_state=RANDOM_STATE),
+    }
+
+    trained_models = {}
+    for name, model in models.items():
+        print(f" - Training {name} ...")
+        model.fit(X_train, y_train)
+        trained_models[name] = model
+        print(f"   -> {name} trained. Example params: { {k: v for k, v in list(model.get_params().items())[:6]} }")
+        # Plot feature importances / coefficients if possible
+        try:
+            plot_feature_importances(model, feature_names=X_train.columns.tolist(), name=name, top_n=12)
+        except Exception as e:
+            print(f"   -> Could not plot feature importances for {name}: {e}")
+
+    return trained_models
+
+
+def validate_models(trained_models: Dict[str, object], X_test: pd.DataFrame, y_test: pd.Series, meta: Dict) -> Dict[str, Dict[str, float]]:
+    """
+    Evaluate models on test set, print metrics and produce confusion matrices and a comparison plot.
+    """
+    print("\n[10] Validating models on the test set...")
+    results = {}
+    # If label encoder for target exists, get class names for plotting
+    le_target = meta.get("label_encoders", {}).get(meta.get("target_col", "") + "_target", None)
+    class_names = None
+    if le_target is not None:
+        class_names = list(le_target.classes_)
+
+    for name, model in trained_models.items():
+        print(f"\n--- Evaluating {name} ---")
+        y_pred = model.predict(X_test)
+        acc = accuracy_score(y_test, y_pred)
+        prec = precision_score(y_test, y_pred, average="weighted", zero_division=0)
+        rec = recall_score(y_test, y_pred, average="weighted", zero_division=0)
+        f1 = f1_score(y_test, y_pred, average="weighted", zero_division=0)
+
+        print(f"Accuracy : {acc:.4f}")
+        print(f"Precision: {prec:.4f}")
+        print(f"Recall   : {rec:.4f}")
+        print(f"F1-score : {f1:.4f}")
+        print("\nClassification Report:")
+        print(classification_report(y_test, y_pred, zero_division=0))
+
+        # Confusion matrix plot
+        try:
+            plot_confusion_matrix_heatmap(y_test, y_pred, classes=class_names, name=name)
+        except Exception as e:
+            print(f"   -> Could not plot confusion matrix for {name}: {e}")
+
+        results[name] = {"accuracy": acc, "precision": prec, "recall": rec, "f1": f1}
+
+    # Aggregate comparison plot
+    try:
+        plot_metrics_comparison(results, prefix="metrics")
+    except Exception as e:
+        print(f"   -> Could not plot metrics comparison: {e}")
+
+    # Print summary
+    print("\n[Summary] Model performance comparison (test set):")
+    for name, metrics in results.items():
+        print(f" - {name:15s} | Acc: {metrics['accuracy']:.4f} | Prec: {metrics['precision']:.4f} | Rec: {metrics['recall']:.4f} | F1: {metrics['f1']:.4f}")
+
+    return results
+
+
+def cross_validate_models(trained_models: Dict[str, object], X: pd.DataFrame, y: pd.Series, k: int = 5) -> Dict[str, np.ndarray]:
+    """
+    Perform Stratified K-Fold cross-validation for each model.
+    Returns dictionary of arrays (accuracy scores per fold) for each model and plots a boxplot.
+    """
+    print(f"\n[11] Cross-Validation using StratifiedKFold (k={k}) on full dataset...")
+    cv = StratifiedKFold(n_splits=k, shuffle=True, random_state=RANDOM_STATE)
+    cv_scores = {}
+    for name, model in trained_models.items():
+        print(f" - Cross-validating {name} ...")
+        try:
+            scores = cross_val_score(model, X, y, cv=cv, scoring="accuracy", n_jobs=-1)
+            cv_scores[name] = scores
+            print(f"   -> Scores: {scores}")
+            print(f"   -> Mean accuracy: {scores.mean():.4f} (+/- {scores.std():.4f})")
+        except Exception as e:
+            print(f"   -> Cross-validation failed for {name}: {e}")
+            cv_scores[name] = np.array([])
+
+    # Plot boxplot of CV scores
+    try:
+        plot_cv_boxplot(cv_scores, prefix="cv")
+    except Exception as e:
+        print(f"   -> Could not plot CV boxplot: {e}")
+
+    return cv_scores
+
+
+def main():
+    print("=== Predictive Risk Modeling Framework for Microplastic Pollution (with visualizations) ===")
+    X_train, X_test, y_train, y_test, meta = load_and_preprocess_data(csv_path="MicroPlastic.csv")
+
+    # Train models
+    trained_models = train_models(X_train, y_train)
+
+    # Validate on test set (produces confusion matrices + metrics plot)
+    test_results = validate_models(trained_models, X_test, y_test, meta)
+
+    # Combine train+test for cross-validation
+    X_full = pd.concat([X_train, X_test], axis=0)
+    y_full = pd.concat([y_train, y_test], axis=0)
+
+    # Cross-validate and plot CV accuracies
+    cv_scores = cross_validate_models(trained_models, X_full, y_full, k=5)
+
+    # Save summary CSVs of results
+    try:
+        pd.DataFrame(test_results).T.to_csv(os.path.join(OUTPUT_DIR, "test_results_summary.csv"))
+        cv_summary = {k: (np.mean(v) if v.size else np.nan) for k, v in cv_scores.items()}
+        pd.Series(cv_summary).to_csv(os.path.join(OUTPUT_DIR, "cv_mean_accuracy_summary.csv"))
+        print(f"\n - Summary CSVs saved to {OUTPUT_DIR}")
+    except Exception as e:
+        print(f"   -> Could not save summary CSVs: {e}")
+
+    print("\n=== Completed end-to-end run with visualizations ===")
+    print(f"All plots and summaries saved in the folder: {os.path.abspath(OUTPUT_DIR)}")
+
+
+if __name__ == "__main__":
+    main()
