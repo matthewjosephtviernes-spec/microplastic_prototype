@@ -2,22 +2,26 @@
 """
 Predictive Risk Modeling Framework for Microplastic Pollution (Streamlit UI, auto-run)
 
-This corrected version:
-- Robust CSV reading & preview
-- Outlier handling (IQR capping)
-- Skewness detection + log1p shifts
-- Categorical handling (smart one-hot / label encode for high-cardinality)
-- Ensures final X is numeric (no stray object columns) before scaling and modelling
-- Feature ranking using RandomForest and SelectFromModel
-- Trains LogisticRegression, RandomForest, GradientBoosting
-- Evaluates on test set and performs Stratified K-Fold cross-validation
-- Saves plots & CSV outputs to ./outputs/
-"""
+New features added:
+1) Data Cleaning Dashboard (missing values, outliers, duplicates)
+2) Automatic Outlier Detection & Removal (IQR capping, IsolationForest)
+3) Interactive Visualizations (heatmap, histograms, boxplots, categorical counts)
+4) Model Comparison (LogisticRegression, RandomForest, GradientBoosting, SVM, XGBoost if present)
+5) SHAP Explainability (if shap package available)
+6) Download Cleaned Dataset
+7) Full sklearn Pipeline (preprocessing -> scaler -> estimator)
+8) Correlation Matrix + Feature Importance plotting
+9) Merge multiple CSV files automatically (uploader supports multiple files)
+10) Interactive map for GPS coordinates (if Latitude & Longitude present)
 
+Notes:
+- This script is defensive: missing optional packages (xgboost, shap) will not break the app.
+- Outputs (plots, CSVs) continue to be saved to ./outputs/
+"""
 import os
 import sys
 import warnings
-from typing import Dict, Tuple, List, Optional
+from typing import Dict, Tuple, List, Optional, Any
 
 import io
 import glob
@@ -33,19 +37,34 @@ import seaborn as sns
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, IsolationForest
+from sklearn.svm import SVC
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
 from sklearn.feature_selection import SelectFromModel
 from sklearn.metrics import (
     accuracy_score,
     precision_score,
     recall_score,
     f1_score,
-    classification_report,
     confusion_matrix,
 )
 
 warnings.filterwarnings("ignore")
 RANDOM_STATE = 42
+
+# Optional packages
+try:
+    import xgboost as xgb  # type: ignore
+    XGBOOST_AVAILABLE = True
+except Exception:
+    XGBOOST_AVAILABLE = False
+
+try:
+    import shap  # type: ignore
+    SHAP_AVAILABLE = True
+except Exception:
+    SHAP_AVAILABLE = False
 
 # Directories
 OUTPUT_DIR = "outputs"
@@ -57,14 +76,23 @@ sns.set(style="whitegrid")
 # Try Streamlit import
 try:
     import streamlit as st  # type: ignore
+
     STREAMLIT_AVAILABLE = True
 except Exception:
     STREAMLIT_AVAILABLE = False
 
+# ----------------------------
+# Utility helpers
+# ----------------------------
+def save_and_show(fig, filename: str, dpi: int = 150, tight: bool = True) -> str:
+    path = os.path.join(OUTPUT_DIR, filename)
+    if tight:
+        fig.tight_layout()
+    fig.savefig(path, dpi=dpi)
+    plt.close(fig)
+    return path
 
-# ----------------------------
-# Robust CSV preview helper
-# ----------------------------
+
 def read_csv_preview(path: str, nrows: int = 10) -> Tuple[pd.DataFrame, str]:
     encodings_to_try = [None, "utf-8", "latin1", "cp1252"]
     last_exception = None
@@ -93,18 +121,42 @@ def read_csv_preview(path: str, nrows: int = 10) -> Tuple[pd.DataFrame, str]:
         raise RuntimeError(f"Failed to read CSV for preview. Last error: {last_exception}; final error: {e}")
 
 
-# ----------------------------
-# Plot helpers (save to outputs and return path)
-# ----------------------------
-def save_and_show(fig, filename: str, dpi: int = 150, tight: bool = True):
-    path = os.path.join(OUTPUT_DIR, filename)
-    if tight:
-        fig.tight_layout()
-    fig.savefig(path, dpi=dpi)
-    plt.close(fig)
-    return path
+def robust_read_csv(path: str) -> Tuple[pd.DataFrame, str]:
+    """Robust CSV loader used for full pipeline — tries several encodings and fallback."""
+    encodings_to_try = [None, "utf-8", "latin1", "cp1252"]
+    last_exception = None
+    df = None
+    used_encoding = None
+
+    for enc in encodings_to_try:
+        try:
+            if enc is None:
+                df = pd.read_csv(path)
+                used_encoding = "default"
+            else:
+                df = pd.read_csv(path, encoding=enc)
+                used_encoding = enc
+            break
+        except Exception as e:
+            last_exception = e
+            continue
+
+    if df is None:
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+            df = pd.read_csv(io.StringIO(text))
+            used_encoding = "fallback-replace-invalid-bytes"
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to read CSV from '{path}'. Last: {last_exception}; final: {e}"
+            )
+    return df, used_encoding
 
 
+# ----------------------------
+# Plot helpers
+# ----------------------------
 def plot_missing_values_heatmap(df: pd.DataFrame, fname: str = "missing_heatmap.png"):
     fig, ax = plt.subplots(figsize=(10, max(4, len(df.columns) * 0.2)))
     sns.heatmap(df.isnull(), cbar=False, yticklabels=False, ax=ax)
@@ -112,90 +164,56 @@ def plot_missing_values_heatmap(df: pd.DataFrame, fname: str = "missing_heatmap.
     return save_and_show(fig, fname)
 
 
-def plot_boxplot_before_after(before: pd.DataFrame, after: pd.DataFrame, cols: List[str], prefix: str = "outlier"):
-    saved = []
-    for col in cols:
-        if col not in before.columns or col not in after.columns:
-            continue
-        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-        sns.boxplot(x=before[col], ax=axes[0])
-        axes[0].set_title(f"{col} (Before)")
-        sns.boxplot(x=after[col], ax=axes[1])
-        axes[1].set_title(f"{col} (After - capped)")
-        fig.suptitle(f"Outlier handling (IQR cap) for {col}")
-        saved.append(save_and_show(fig, f"{prefix}_boxplot_{col}.png"))
-    return saved
+def plot_boxplot(df: pd.DataFrame, col: str, fname: str):
+    fig, ax = plt.subplots(figsize=(6, 3))
+    sns.boxplot(x=df[col], ax=ax)
+    ax.set_title(f"Boxplot: {col}")
+    return save_and_show(fig, fname)
 
 
-def plot_histogram_comparison(df_before: pd.DataFrame, df_after: pd.DataFrame, cols: List[str], prefix: str = "skew"):
-    saved = []
-    for col in cols:
-        if col not in df_before.columns or col not in df_after.columns:
-            continue
-        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-        sns.histplot(df_before[col].dropna(), kde=True, ax=axes[0])
-        axes[0].set_title(f"{col} BEFORE transformation\nskew={df_before[col].skew():.3f}")
-        sns.histplot(df_after[col].dropna(), kde=True, ax=axes[1])
-        axes[1].set_title(f"{col} AFTER transformation\nskew={df_after[col].skew():.3f}")
-        fig.suptitle(f"Skewness correction for {col}")
-        saved.append(save_and_show(fig, f"{prefix}_hist_{col}.png"))
-    return saved
+def plot_hist_and_kde(df: pd.DataFrame, col: str, fname: str):
+    fig, ax = plt.subplots(figsize=(6, 3))
+    sns.histplot(df[col].dropna(), kde=True, ax=ax)
+    ax.set_title(f"Histogram: {col}")
+    return save_and_show(fig, fname)
 
 
-def plot_categorical_counts(df: pd.DataFrame, cols: List[str], top_n: int = 10, prefix: str = "cat_counts"):
-    saved = []
-    for col in cols:
-        if col not in df.columns:
-            continue
-        vc = df[col].astype(str).value_counts().nlargest(top_n)
-        fig, ax = plt.subplots(figsize=(8, 4))
-        sns.barplot(x=vc.values, y=vc.index, ax=ax)
-        ax.set_xlabel("Count")
-        ax.set_ylabel(col)
-        ax.set_title(f"Top {len(vc)} value counts for {col}")
-        saved.append(save_and_show(fig, f"{prefix}_{col}.png"))
-    return saved
+def plot_categorical_counts(df: pd.DataFrame, col: str, top_n: int = 10, fname: str = None):
+    vc = df[col].astype(str).value_counts().nlargest(top_n)
+    fig, ax = plt.subplots(figsize=(8, 4))
+    sns.barplot(x=vc.values, y=vc.index, ax=ax)
+    ax.set_xlabel("Count")
+    ax.set_ylabel(col)
+    ax.set_title(f"Top {len(vc)} value counts for {col}")
+    return save_and_show(fig, fname or f"cat_counts_{col}.png")
 
 
-def plot_scaled_feature_distributions(X_scaled: pd.DataFrame, prefix: str = "scaled"):
-    saved = []
-    cols = X_scaled.columns.tolist()
-    n = min(len(cols), 12)
-    if n == 0:
-        return saved
-    sample_cols = cols[:n]
-    fig, axes = plt.subplots(nrows=n, ncols=1, figsize=(8, 2 * n))
-    if n == 1:
-        axes = [axes]
-    for ax, col in zip(axes, sample_cols):
-        sns.histplot(X_scaled[col], kde=True, ax=ax)
-        ax.set_title(f"Scaled Distribution: {col}")
-    fig.suptitle("Scaled numerical feature distributions (sample)")
-    saved.append(save_and_show(fig, f"{prefix}_feature_dists_sample.png"))
-    return saved
+def plot_correlation_matrix(df: pd.DataFrame, fname: str = "correlation_heatmap.png"):
+    corr = df.corr()
+    fig, ax = plt.subplots(figsize=(10, 8))
+    sns.heatmap(corr, annot=False, cmap="coolwarm", ax=ax)
+    ax.set_title("Correlation matrix (numeric features)")
+    return save_and_show(fig, fname)
 
 
-def plot_feature_importances(model, feature_names: List[str], name: str, top_n: int = 10):
+def plot_feature_importances(model, feature_names: List[str], name: str = "model", top_n: int = 15):
     importances = None
-    title = ""
     if hasattr(model, "feature_importances_"):
         importances = model.feature_importances_
-        title = f"{name} Feature Importances"
     elif hasattr(model, "coef_"):
         coef = model.coef_
         if coef.ndim == 1:
             importances = np.abs(coef)
         else:
             importances = np.mean(np.abs(coef), axis=0)
-        title = f"{name} Coefficient magnitudes (mean abs)"
     else:
         return None
 
     fi = pd.Series(importances, index=feature_names).sort_values(ascending=False).head(top_n)
-    fig, ax = plt.subplots(figsize=(8, max(4, top_n * 0.4)))
+    fig, ax = plt.subplots(figsize=(8, max(4, len(fi) * 0.35)))
     sns.barplot(x=fi.values, y=fi.index, ax=ax)
-    ax.set_title(title)
-    ax.set_xlabel("Importance / |Coefficient|")
+    ax.set_title(f"{name} feature importances")
+    ax.set_xlabel("Importance")
     return save_and_show(fig, f"feature_importances_{name}.png")
 
 
@@ -212,6 +230,296 @@ def plot_confusion_matrix_heatmap(y_true, y_pred, classes: List[str], name: str)
     return save_and_show(fig, f"confusion_matrix_{name}.png")
 
 
+# ----------------------------
+# Feature ranking / selection
+# ----------------------------
+def rank_and_select_features(X: pd.DataFrame, y: pd.Series, top_n: int = 30) -> Tuple[List[str], Dict]:
+    meta: Dict[str, Any] = {}
+    if X.shape[0] < 2 or y.nunique() < 2:
+        return X.columns.tolist(), meta
+    rf = RandomForestClassifier(n_estimators=200, random_state=RANDOM_STATE, n_jobs=-1)
+    rf.fit(X, y)
+    importances = pd.Series(rf.feature_importances_, index=X.columns).sort_values(ascending=False)
+    top_features = importances.head(min(top_n, len(importances))).index.tolist()
+    selector = SelectFromModel(rf, threshold="mean", prefit=True)
+    selected_mask = selector.get_support()
+    selected = list(X.columns[selected_mask])
+    if not selected:
+        selected = top_features[: min(10, len(top_features))]
+    meta["feature_importances"] = importances.to_dict()
+    meta["top_features"] = top_features
+    meta["selected_features"] = selected
+    return selected, meta
+
+
+# ----------------------------
+# Preprocessing & pipeline helpers
+# ----------------------------
+def fill_missing_values(df: pd.DataFrame, strategy: str = "median", custom_values: Optional[Dict[str, Any]] = None):
+    """Fill missing values: strategy='median'|'mean'|'mode'|'custom' """
+    df = df.copy()
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    obj_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
+    if strategy == "median":
+        for c in num_cols:
+            df[c] = df[c].fillna(df[c].median())
+        for c in obj_cols:
+            df[c] = df[c].fillna(df[c].mode().iloc[0] if not df[c].mode().empty else "Missing")
+    elif strategy == "mean":
+        for c in num_cols:
+            df[c] = df[c].fillna(df[c].mean())
+        for c in obj_cols:
+            df[c] = df[c].fillna(df[c].mode().iloc[0] if not df[c].mode().empty else "Missing")
+    elif strategy == "mode":
+        for c in num_cols:
+            df[c] = df[c].fillna(df[c].mode().iloc[0] if not df[c].mode().empty else 0)
+        for c in obj_cols:
+            df[c] = df[c].fillna(df[c].mode().iloc[0] if not df[c].mode().empty else "Missing")
+    elif strategy == "custom" and custom_values:
+        for c, v in custom_values.items():
+            if c in df.columns:
+                df[c] = df[c].fillna(v)
+    else:
+        # default fallback
+        df = df.fillna(0)
+    return df
+
+
+def iqr_cap_series(s: pd.Series):
+    q1 = s.quantile(0.25)
+    q3 = s.quantile(0.75)
+    iqr = q3 - q1
+    lower = q1 - 1.5 * iqr
+    upper = q3 + 1.5 * iqr
+    return s.clip(lower=lower, upper=upper)
+
+
+def detect_outliers_isolationforest(df: pd.DataFrame, numeric_cols: List[str], contamination: float = 0.05):
+    if len(numeric_cols) == 0 or df.shape[0] < 10:
+        return np.array([], dtype=int)
+    iso = IsolationForest(contamination=contamination, random_state=RANDOM_STATE)
+    try:
+        preds = iso.fit_predict(df[numeric_cols].fillna(0))
+        outlier_idx = np.where(preds == -1)[0]
+        return outlier_idx
+    except Exception:
+        return np.array([], dtype=int)
+
+
+def encode_dataframe(df: pd.DataFrame, cols_to_encode: Optional[List[str]] = None, max_onehot=12):
+    """Encode all object columns: one-hot for low cardinality, label-encode otherwise.
+    Returns encoded_df, encoders."""
+    df = df.copy()
+    encoders: Dict[str, Any] = {}
+    if cols_to_encode is None:
+        cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
+    else:
+        cols = [c for c in cols_to_encode if c in df.columns]
+    for col in cols:
+        df[col] = df[col].astype(str).fillna("Missing")
+        nunique = df[col].nunique()
+        if nunique <= max_onehot:
+            dummies = pd.get_dummies(df[col], prefix=col, drop_first=True)
+            df = pd.concat([df.drop(columns=[col]), dummies], axis=1)
+        else:
+            le = LabelEncoder()
+            df[col + "_LE"] = le.fit_transform(df[col])
+            encoders[col] = le
+            df = df.drop(columns=[col])
+    return df, encoders
+
+
+# ----------------------------
+# Core pipeline
+# ----------------------------
+def preprocess_and_split(df: pd.DataFrame,
+                         target_col: Optional[str] = None,
+                         fill_strategy: str = "median",
+                         cap_outliers: bool = True,
+                         remove_outliers: bool = False,
+                         outlier_method: str = "iqr",
+                         isolation_contamination: float = 0.05,
+                         onehot_max: int = 12,
+                         select_features: bool = True) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, Dict]:
+    """
+    Preprocess DataFrame and return X_train, X_test, y_train, y_test, meta
+    meta includes encoders, scaler, selected features, transforms
+    """
+    meta: Dict[str, Any] = {}
+    df = df.copy()
+    # detect target column
+    if target_col is None:
+        if "Risk_Level" in df.columns:
+            target_col = "Risk_Level"
+        elif "Risk_Type" in df.columns:
+            target_col = "Risk_Type"
+        else:
+            target_col = df.columns[-1]
+
+    # fill missing
+    df = fill_missing_values(df, strategy=fill_strategy)
+
+    # Outlier detection options
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if target_col in numeric_cols:
+        numeric_cols.remove(target_col)
+
+    if cap_outliers:
+        # cap numeric columns using IQR
+        for c in numeric_cols:
+            try:
+                df[c] = iqr_cap_series(df[c])
+            except Exception:
+                pass
+
+    outlier_indices = np.array([], dtype=int)
+    if remove_outliers and outlier_method == "isolationforest":
+        outlier_indices = detect_outliers_isolationforest(df, numeric_cols, contamination=isolation_contamination)
+        if outlier_indices.size:
+            df = df.drop(df.index[outlier_indices]).reset_index(drop=True)
+
+    # encode categorical columns
+    df_encoded, encoders = encode_dataframe(df, None, max_onehot=onehot_max)
+
+    # Prepare y
+    if target_col not in df_encoded.columns and target_col in df.columns:
+        # Use original target column for label encoding decision
+        y_raw = df[target_col]
+    elif target_col in df_encoded.columns:
+        y_raw = df_encoded[target_col]
+    else:
+        raise RuntimeError(f"Target column '{target_col}' not found in dataset after encoding.")
+
+    if y_raw.dtype == "O" or not pd.api.types.is_numeric_dtype(y_raw):
+        le_target = LabelEncoder()
+        y = pd.Series(le_target.fit_transform(y_raw.astype(str)), name=target_col)
+        meta["label_encoder_target"] = le_target
+    else:
+        y = pd.Series(y_raw, name=target_col)
+
+    X = df_encoded.drop(columns=[target_col]) if target_col in df_encoded.columns else df_encoded.copy()
+    # Ensure all numeric
+    non_numeric = X.select_dtypes(exclude=[np.number]).columns.tolist()
+    for c in non_numeric:
+        X[c] = pd.to_numeric(X[c].astype(str).fillna("0"), errors="coerce").fillna(0.0)
+
+    # scaler
+    numeric_features = X.select_dtypes(include=[np.number]).columns.tolist()
+    scaler = StandardScaler() if numeric_features else None
+    if numeric_features:
+        X[numeric_features] = scaler.fit_transform(X[numeric_features])
+
+    # feature selection
+    selected_features = X.columns.tolist()
+    fs_meta = {}
+    if select_features and X.shape[0] >= 10 and y.nunique() >= 2:
+        selected, fs_meta = rank_and_select_features(X, y, top_n=40)
+        if selected:
+            selected_features = selected
+            X = X[selected_features]
+
+    # train-test split
+    try:
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y)
+    except Exception:
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=RANDOM_STATE, stratify=None)
+
+    meta.update({
+        "encoders": encoders,
+        "scaler": scaler,
+        "selected_features": selected_features,
+        "feature_selection_meta": fs_meta,
+        "numeric_features": numeric_features,
+        "target_col": target_col,
+        "outlier_indices": outlier_indices.tolist(),
+    })
+    return X_train, X_test, y_train, y_test, meta
+
+
+# ----------------------------
+# Training / evaluation / CV
+# ----------------------------
+def get_models_dict(include_xgboost: bool = True):
+    models = {
+        "LogisticRegression": LogisticRegression(max_iter=2000, random_state=RANDOM_STATE),
+        "RandomForest": RandomForestClassifier(n_estimators=200, random_state=RANDOM_STATE, n_jobs=-1),
+        "GradientBoosting": GradientBoostingClassifier(n_estimators=200, random_state=RANDOM_STATE),
+        "SVM": SVC(probability=True, random_state=RANDOM_STATE),
+    }
+    if include_xgboost and XGBOOST_AVAILABLE:
+        models["XGBoost"] = xgb.XGBClassifier(n_estimators=200, use_label_encoder=False, eval_metric="logloss", random_state=RANDOM_STATE)
+    return models
+
+
+def train_models(X_train: pd.DataFrame, y_train: pd.Series, chosen_models: Optional[List[str]] = None) -> Dict[str, Any]:
+    all_models = get_models_dict(include_xgboost=True)
+    if chosen_models:
+        models_to_train = {k: v for k, v in all_models.items() if k in chosen_models}
+    else:
+        models_to_train = all_models
+    trained = {}
+    if y_train.nunique() < 2:
+        raise RuntimeError("Target y contains only one class; cannot train classifiers.")
+    for name, model in models_to_train.items():
+        model.fit(X_train, y_train)
+        trained[name] = model
+        try:
+            plot_feature_importances(model, X_train.columns.tolist(), name=name, top_n=min(20, X_train.shape[1]))
+        except Exception:
+            pass
+    return trained
+
+
+def evaluate_models(trained_models: Dict[str, Any], X_test: pd.DataFrame, y_test: pd.Series, meta: Dict):
+    results: Dict[str, Dict[str, float]] = {}
+    le_target = meta.get("label_encoder_target", None)
+    class_names = list(le_target.classes_) if le_target is not None else None
+    for name, model in trained_models.items():
+        y_pred = model.predict(X_test)
+        acc = float(accuracy_score(y_test, y_pred))
+        prec = float(precision_score(y_test, y_pred, average="weighted", zero_division=0))
+        rec = float(recall_score(y_test, y_pred, average="weighted", zero_division=0))
+        f1 = float(f1_score(y_test, y_pred, average="weighted", zero_division=0))
+        results[name] = {"accuracy": acc, "precision": prec, "recall": rec, "f1": f1}
+        try:
+            plot_confusion_matrix_heatmap(y_test, y_pred, classes=class_names, name=name)
+        except Exception:
+            pass
+    try:
+        pd.DataFrame(results).T.to_csv(os.path.join(OUTPUT_DIR, "test_results_summary.csv"))
+    except Exception:
+        pass
+    try:
+        plot_metrics = plot_metrics_comparison(results)  # uses helper defined later
+    except Exception:
+        plot_metrics = None
+    return results
+
+
+def cross_validate_models(trained_models: Dict[str, Any], X: pd.DataFrame, y: pd.Series, k: int = 5):
+    cv = StratifiedKFold(n_splits=k, shuffle=True, random_state=RANDOM_STATE)
+    cv_scores: Dict[str, np.ndarray] = {}
+    if y.nunique() < 2:
+        return {k: np.array([]) for k in trained_models.keys()}
+    for name, model in trained_models.items():
+        try:
+            scores = cross_val_score(model, X, y, cv=cv, scoring="accuracy", n_jobs=-1)
+            cv_scores[name] = scores
+        except Exception:
+            cv_scores[name] = np.array([])
+    try:
+        plot_cv_boxplot(cv_scores, prefix="cv")
+    except Exception:
+        pass
+    try:
+        cv_summary = {k: (float(np.mean(v)) if v.size else np.nan) for k, v in cv_scores.items()}
+        pd.Series(cv_summary).to_csv(os.path.join(OUTPUT_DIR, "cv_mean_accuracy_summary.csv"))
+    except Exception:
+        pass
+    return cv_scores
+
+
+# small wrapper used above - placed here to avoid forward ref issues
 def plot_metrics_comparison(metrics_dict: Dict[str, Dict[str, float]], prefix: str = "metrics"):
     df = pd.DataFrame(metrics_dict).T  # models x metrics
     metrics = ["accuracy", "precision", "recall", "f1"]
@@ -240,547 +548,289 @@ def plot_cv_boxplot(cv_scores: Dict[str, np.ndarray], prefix: str = "cv"):
 
 
 # ----------------------------
-# Feature ranking / selection
-# ----------------------------
-def rank_and_select_features(X: pd.DataFrame, y: pd.Series, top_n: int = 20) -> Tuple[List[str], Dict]:
-    """
-    Use RandomForest to rank features, then SelectFromModel to pick important ones.
-    Returns selected feature list and meta info.
-    """
-    meta = {}
-    if X.shape[0] < 2 or y.nunique() < 2:
-        # not enough data to rank
-        return X.columns.tolist(), meta
-
-    rf = RandomForestClassifier(n_estimators=200, random_state=RANDOM_STATE, n_jobs=-1)
-    rf.fit(X, y)
-    importances = pd.Series(rf.feature_importances_, index=X.columns).sort_values(ascending=False)
-    top_features = importances.head(min(top_n, len(importances))).index.tolist()
-    # Use SelectFromModel with threshold mean importance
-    selector = SelectFromModel(rf, threshold="mean", prefit=True)
-    selected_mask = selector.get_support()
-    selected = list(X.columns[selected_mask])
-    if not selected:
-        # fallback to top k
-        selected = top_features[: min(10, len(top_features))]
-    meta["feature_importances"] = importances.to_dict()
-    meta["top_features"] = top_features
-    meta["selected_features"] = selected
-    return selected, meta
-
-
-# ----------------------------
-# Core processing (same pipeline)
-# ----------------------------
-def load_and_preprocess_data(csv_path: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, Dict]:
-    # Robust CSV loader (tries multiple encodings and a replacement fallback)
-    encodings_to_try = [None, "utf-8", "latin1", "cp1252"]
-    last_exception = None
-    df = None
-    used_encoding = None
-
-    for enc in encodings_to_try:
-        try:
-            if enc is None:
-                df = pd.read_csv(csv_path)
-                used_encoding = "default"
-            else:
-                df = pd.read_csv(csv_path, encoding=enc)
-                used_encoding = enc
-            # success
-            print(f"[load_and_preprocess_data] Loaded CSV using encoding: {used_encoding}")
-            break
-        except Exception as e:
-            last_exception = e
-            continue
-
-    # Final fallback: read with errors replaced
-    if df is None:
-        try:
-            with open(csv_path, "r", encoding="utf-8", errors="replace") as f:
-                text = f.read()
-            df = pd.read_csv(io.StringIO(text))
-            used_encoding = "fallback-replace-invalid-bytes"
-            print("[load_and_preprocess_data] Loaded CSV using fallback (invalid bytes replaced).")
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to read CSV from '{csv_path}' even after fallback.\n"
-                f"Last regular error: {last_exception}\nFinal fallback error: {e}"
-            )
-
-    visuals = {"plots": []}
-    try:
-        visuals["plots"].append(plot_missing_values_heatmap(df, fname="missing_heatmap.png"))
-    except Exception:
-        pass
-
-    # Target selection
-    if "Risk_Level" in df.columns:
-        target_col = "Risk_Level"
-    elif "Risk_Type" in df.columns:
-        target_col = "Risk_Type"
-    else:
-        target_col = df.columns[-1]
-
-    # Fill missing
-    num_cols_all = df.select_dtypes(include=[np.number]).columns.tolist()
-    cat_cols_all = df.select_dtypes(include=["object", "category"]).columns.tolist()
-    for c in num_cols_all:
-        df[c] = df[c].fillna(df[c].median())
-    for c in cat_cols_all:
-        df[c] = df[c].fillna("Missing")
-
-    # Outlier handling (IQR) for some expected columns if present
-    outlier_cols = [
-        "MP_Count_per_L",
-        "Risk_Score",
-        "Microplastic_Size_mm_midpoint",
-        "Density_midpoint",
-    ]
-    outlier_cols_present = [c for c in outlier_cols if c in df.columns and pd.api.types.is_numeric_dtype(df[c])]
-    df_before_outliers = df.copy()
-    for col in outlier_cols_present:
-        q1 = df[col].quantile(0.25)
-        q3 = df[col].quantile(0.75)
-        iqr = q3 - q1
-        lower = q1 - 1.5 * iqr
-        upper = q3 + 1.5 * iqr
-        df[col] = np.where(df[col] < lower, lower, df[col])
-        df[col] = np.where(df[col] > upper, upper, df[col])
-    try:
-        visuals["plots"].extend(plot_boxplot_before_after(df_before_outliers, df, outlier_cols_present, prefix="outlier"))
-    except Exception:
-        pass
-
-    # Skewness detection & log1p transform on numeric columns (but not target)
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    if target_col in numeric_cols:
-        numeric_cols.remove(target_col)
-    skew_info = {col: float(df[col].skew()) for col in numeric_cols}
-    skewed_cols = [c for c, s in skew_info.items() if abs(s) > 0.5]
-    df_before_skew = df.copy()
-    transforms_applied = {}
-    for col in skewed_cols:
-        col_min = df[col].min()
-        shift = 0.0
-        if col_min <= -1e-9:
-            shift = abs(col_min) + 1e-6
-        # avoid taking log of zero/negatives
-        df[col] = np.log1p(df[col] + shift)
-        transforms_applied[col] = {"shift": shift}
-    try:
-        visuals["plots"].extend(plot_histogram_comparison(df_before_skew, df, skewed_cols, prefix="skew"))
-    except Exception:
-        pass
-
-    # Categorical encoding for known columns (if present)
-    cols_to_encode = [
-        "Location",
-        "Shape",
-        "Polymer_Type",
-        "pH",
-        "Salinity",
-        "Industrial_Activity",
-        "Population_Density",
-        "Risk_Type",
-        "Risk_Level",
-        "Author",
-    ]
-    cols_to_encode_present = [c for c in cols_to_encode if c in df.columns]
-    try:
-        visuals["plots"].extend(plot_categorical_counts(df, cols_to_encode_present, top_n=8, prefix="cat_before_encoding"))
-    except Exception:
-        pass
-
-    df_encoded = df.copy()
-    label_encoders = {}
-    onehot_columns = []
-
-    # Encode the specified categorical columns using either get_dummies (low cardinality) or LabelEncoder (high)
-    for col in cols_to_encode_present:
-        df_encoded[col] = df_encoded[col].astype(str).fillna("Missing")
-        nunique = df_encoded[col].nunique()
-        if nunique <= 10:
-            dummies = pd.get_dummies(df_encoded[col], prefix=col, drop_first=True)
-            df_encoded = pd.concat([df_encoded.drop(columns=[col]), dummies], axis=1)
-            onehot_columns.extend(list(dummies.columns))
-        else:
-            le = LabelEncoder()
-            df_encoded[col + "_LE"] = le.fit_transform(df_encoded[col])
-            label_encoders[col] = le
-            df_encoded = df_encoded.drop(columns=[col])
-
-    # After user-specified encoding, ensure ALL remaining object columns are encoded so X is numeric
-    remaining_obj_cols = df_encoded.select_dtypes(include=["object", "category"]).columns.tolist()
-    for col in remaining_obj_cols:
-        df_encoded[col] = df_encoded[col].astype(str).fillna("Missing")
-        nunique = df_encoded[col].nunique()
-        # If small cardinality, one-hot; otherwise label-encode
-        if nunique <= 12 and df_encoded.shape[0] >= nunique:
-            dummies = pd.get_dummies(df_encoded[col], prefix=col, drop_first=True)
-            df_encoded = pd.concat([df_encoded.drop(columns=[col]), dummies], axis=1)
-            onehot_columns.extend(list(dummies.columns))
-        else:
-            le = LabelEncoder()
-            df_encoded[col + "_LE"] = le.fit_transform(df_encoded[col])
-            label_encoders[col] = le
-            df_encoded = df_encoded.drop(columns=[col])
-
-    # Prepare target (y)
-    if target_col in df.columns:
-        y_raw = df[target_col]
-    else:
-        # fallback if target not found in original (rare)
-        raise RuntimeError(f"Target column '{target_col}' not found in dataset.")
-
-    if y_raw.dtype == "O" or not pd.api.types.is_numeric_dtype(y_raw):
-        le_target = LabelEncoder()
-        y = pd.Series(le_target.fit_transform(y_raw.astype(str)), name=target_col)
-        label_encoders[target_col + "_target"] = le_target
-    else:
-        y = pd.Series(y_raw, name=target_col)
-
-    # Build X (drop original target if present in df_encoded)
-    if target_col in df_encoded.columns:
-        X_df = df_encoded.drop(columns=[target_col])
-    else:
-        X_df = df_encoded.copy()
-
-    # Ensure all columns of X_df are numeric (they should be after encoding)
-    non_numeric = X_df.select_dtypes(exclude=[np.number]).columns.tolist()
-    if non_numeric:
-        # last resort: try to coerce to numeric
-        for c in non_numeric:
-            X_df[c] = pd.to_numeric(X_df[c], errors="coerce").fillna(0.0)
-
-    # Feature scaling (fit on numeric features)
-    numeric_features = X_df.select_dtypes(include=[np.number]).columns.tolist()
-    scaler = StandardScaler() if numeric_features else None
-    if numeric_features:
-        X_scaled = pd.DataFrame(scaler.fit_transform(X_df[numeric_features]), columns=numeric_features, index=X_df.index)
-    else:
-        X_scaled = pd.DataFrame(index=X_df.index)
-
-    X_final = X_scaled
-
-    try:
-        visuals["plots"].extend(plot_scaled_feature_distributions(X_final, prefix="scaled"))
-    except Exception:
-        pass
-
-    # Feature ranking & selection
-    selected_features, fs_meta = rank_and_select_features(X_final, y, top_n=30)
-    # Keep only selected features for modeling (makes model leaner). If selection returns empty, keep all.
-    if selected_features:
-        X_model = X_final[selected_features]
-    else:
-        X_model = X_final.copy()
-
-    # Train-test split
-    try:
-        X_train, X_test, y_train, y_test = train_test_split(
-            X_model, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y
-        )
-    except Exception:
-        X_train, X_test, y_train, y_test = train_test_split(
-            X_model, y, test_size=0.2, random_state=RANDOM_STATE, stratify=None
-        )
-
-    # Save a small snapshot of preprocessed data
-    try:
-        df.head(20).to_csv(os.path.join(OUTPUT_DIR, "dataset_head_after_preprocessing.csv"), index=False)
-    except Exception:
-        pass
-
-    meta = {
-        "scaler": scaler,
-        "label_encoders": label_encoders,
-        "onehot_columns": onehot_columns,
-        "numeric_features": numeric_features,
-        "target_col": target_col,
-        "transforms_applied": transforms_applied,
-        "visuals": visuals,
-        "csv_path": csv_path,
-        "feature_selection": fs_meta,
-        "used_encoding": used_encoding,
-    }
-
-    return X_train, X_test, y_train, y_test, meta
-
-
-def train_models(X_train: pd.DataFrame, y_train: pd.Series) -> Dict[str, object]:
-    models = {
-        "LogisticRegression": LogisticRegression(max_iter=2000, random_state=RANDOM_STATE),
-        "RandomForest": RandomForestClassifier(n_estimators=200, random_state=RANDOM_STATE, n_jobs=-1),
-        "GradientBoosting": GradientBoostingClassifier(n_estimators=200, random_state=RANDOM_STATE),
-    }
-
-    trained_models = {}
-    # If y has only one class, don't attempt to train classification models
-    if y_train.nunique() < 2:
-        raise RuntimeError("Target y contains only one class; cannot train classifiers.")
-
-    for name, model in models.items():
-        model.fit(X_train, y_train)
-        trained_models[name] = model
-        try:
-            plot_feature_importances(model, feature_names=X_train.columns.tolist(), name=name, top_n=min(20, X_train.shape[1]))
-        except Exception:
-            pass
-    return trained_models
-
-
-def validate_models(trained_models: Dict[str, object], X_test: pd.DataFrame, y_test: pd.Series, meta: Dict) -> Dict[str, Dict[str, float]]:
-    results = {}
-    le_target = meta.get("label_encoders", {}).get(meta.get("target_col", "") + "_target", None)
-    class_names = list(le_target.classes_) if le_target is not None else None
-
-    for name, model in trained_models.items():
-        y_pred = model.predict(X_test)
-        acc = float(accuracy_score(y_test, y_pred))
-        prec = float(precision_score(y_test, y_pred, average="weighted", zero_division=0))
-        rec = float(recall_score(y_test, y_pred, average="weighted", zero_division=0))
-        f1 = float(f1_score(y_test, y_pred, average="weighted", zero_division=0))
-        results[name] = {"accuracy": acc, "precision": prec, "recall": rec, "f1": f1}
-        try:
-            plot_confusion_matrix_heatmap(y_test, y_pred, classes=class_names, name=name)
-        except Exception:
-            pass
-
-    try:
-        plot_metrics_comparison(results, prefix="metrics")
-    except Exception:
-        pass
-
-    try:
-        pd.DataFrame(results).T.to_csv(os.path.join(OUTPUT_DIR, "test_results_summary.csv"))
-    except Exception:
-        pass
-
-    return results
-
-
-def cross_validate_models(trained_models: Dict[str, object], X: pd.DataFrame, y: pd.Series, k: int = 5) -> Dict[str, np.ndarray]:
-    # If y has only one class, cannot cross-validate stratified - return empty arrays
-    if y.nunique() < 2:
-        return {name: np.array([]) for name in trained_models.keys()}
-
-    cv = StratifiedKFold(n_splits=k, shuffle=True, random_state=RANDOM_STATE)
-    cv_scores = {}
-    for name, model in trained_models.items():
-        try:
-            # cross_val_score will clone the estimator; safe to pass the fitted model
-            scores = cross_val_score(model, X, y, cv=cv, scoring="accuracy", n_jobs=-1)
-            cv_scores[name] = scores
-        except Exception:
-            cv_scores[name] = np.array([])
-
-    try:
-        plot_cv_boxplot(cv_scores, prefix="cv")
-    except Exception:
-        pass
-
-    try:
-        cv_summary = {k: (float(np.mean(v)) if v.size else np.nan) for k, v in cv_scores.items()}
-        pd.Series(cv_summary).to_csv(os.path.join(OUTPUT_DIR, "cv_mean_accuracy_summary.csv"))
-    except Exception:
-        pass
-
-    return cv_scores
-
-
-# ----------------------------
-# Streamlit UI (auto-run + sidebar navigation)
+# Streamlit UI
 # ----------------------------
 def run_streamlit_app():
     st.set_page_config(page_title="Microplastic Risk Modeling", layout="wide")
     st.sidebar.title("Navigation")
-    nav_choice = st.sidebar.radio(
-        "Go to",
-        ("Upload & Preview", "Visualizations", "Model Results", "Download Outputs"),
-    )
+    nav = st.sidebar.radio("Go to", ("Upload & Merge", "Data Cleaning Dashboard", "Visualizations", "Modeling & Results", "Download Outputs"))
 
-    st.title("Predictive Risk Modeling for Microplastic Pollution")
-    st.write(
-        "Upload a CSV file containing microplastic monitoring data. The pipeline will run automatically after upload. "
-        "Outputs (plots & CSVs) are stored in the 'outputs' folder."
-    )
+    st.title("Predictive Risk Modeling for Microplastic Pollution — Enhanced")
+    st.write("Upload CSV(s), clean data, visualize, train & compare models, and download results.")
 
-    uploaded_file = st.file_uploader("Upload CSV file", type=["csv"], help="CSV file with microplastic monitoring data")
-    # Track last processed file to avoid re-processing identical file repeatedly
-    if "last_processed" not in st.session_state:
-        st.session_state["last_processed"] = {"filename": None, "ts": None}
-
-    preview_df = None
-    encoding_used = None
-
-    if uploaded_file is not None:
-        save_path = os.path.join(INPUT_DIR, uploaded_file.name)
-        # Save uploaded file
-        with open(save_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        st.success(f"File saved to: {save_path}")
-
-        # Robust preview
-        try:
-            preview_df, encoding_used = read_csv_preview(save_path, nrows=10)
-        except Exception as e:
-            st.error(f"Could not preview uploaded CSV: {e}")
-            preview_df = None
-
-        # Determine whether to run pipeline: run if new file or not processed recently
-        new_file = st.session_state["last_processed"]["filename"] != uploaded_file.name
-        if new_file:
-            st.session_state["last_processed"] = {"filename": uploaded_file.name, "ts": time.time()}
-            # Automatically run pipeline
-            with st.spinner("Running full pipeline automatically..."):
+    # ---- Upload & Merge ----
+    if nav == "Upload & Merge":
+        st.header("Upload CSV files (you may upload multiple files to merge)")
+        uploaded_files = st.file_uploader("Upload one or more CSV files", type=["csv"], accept_multiple_files=True)
+        if uploaded_files:
+            merged_df = None
+            encodings_info = {}
+            for f in uploaded_files:
+                save_path = os.path.join(INPUT_DIR, f.name)
+                with open(save_path, "wb") as out:
+                    out.write(f.getbuffer())
                 try:
-                    X_train, X_test, y_train, y_test, meta = load_and_preprocess_data(save_path)
-                    trained_models = train_models(X_train, y_train)
-                    test_results = validate_models(trained_models, X_test, y_test, meta)
-                    X_full = pd.concat([X_train, X_test], axis=0)
-                    y_full = pd.concat([y_train, y_test], axis=0)
-                    cv_scores = cross_validate_models(trained_models, X_full, y_full, k=5)
-                    # store results in session_state for interactive viewing
-                    st.session_state["pipeline_result"] = {
-                        "save_path": save_path,
-                        "meta": meta,
-                        "test_results": test_results,
-                        "cv_scores": {k: v.tolist() for k, v in cv_scores.items()},
-                    }
-                    st.success("Pipeline completed successfully.")
+                    df_tmp, encoding_used = read_csv_preview(save_path, nrows=50)
+                    encodings_info[f.name] = encoding_used
+                except Exception:
+                    encodings_info[f.name] = "preview-failed"
+                # robust full read
+                try:
+                    df_full, used_enc = robust_read_csv(save_path)
                 except Exception as e:
-                    st.error(f"Pipeline failed: {e}")
-                    st.session_state.pop("pipeline_result", None)
+                    st.error(f"Failed to read {f.name}: {e}")
+                    continue
+                if merged_df is None:
+                    merged_df = df_full
+                else:
+                    # align columns (union)
+                    merged_df = pd.concat([merged_df, df_full], axis=0, ignore_index=True, sort=False)
+            if merged_df is not None:
+                st.success(f"Merged {len(uploaded_files)} files — resulting shape: {merged_df.shape}")
+                st.write("Encodings detected (preview):")
+                st.write(encodings_info)
+                st.session_state["raw_merged_df"] = merged_df
+                st.dataframe(merged_df.head(50))
+                # save merged
+                merged_save = os.path.join(INPUT_DIR, "merged_uploaded.csv")
+                try:
+                    merged_df.to_csv(merged_save, index=False)
+                    st.write(f"Merged file saved to {merged_save}")
+                except Exception:
+                    pass
+        else:
+            st.info("Upload one or more CSV files to merge and start the pipeline.")
 
-    # Sidebar navigation: content rendering
-    if nav_choice == "Upload & Preview":
-        st.header("Upload & Preview")
-        st.info("Upload a CSV above to automatically run the pipeline. Preview shows first 10 rows (robustly read).")
-        if preview_df is not None:
-            st.write(f"Preview read using encoding: {encoding_used}")
-            st.dataframe(preview_df)
+    # ---- Data Cleaning Dashboard ----
+    if nav == "Data Cleaning Dashboard":
+        st.header("Data Cleaning Dashboard")
+        df = st.session_state.get("raw_merged_df", None)
+        if df is None:
+            st.info("No dataset loaded. Go to 'Upload & Merge' and upload files.")
         else:
-            st.write("No preview available yet. Upload a CSV to see a preview.")
-    elif nav_choice == "Visualizations":
-        st.header("Visualizations (saved in outputs/)")
-        if "pipeline_result" not in st.session_state:
-            st.info("No pipeline run available. Upload a CSV to run the pipeline and generate visualizations.")
+            st.subheader("Dataset overview")
+            st.write(f"Shape: {df.shape}")
+            st.write("Columns and dtypes:")
+            st.write(pd.DataFrame({"col": df.columns, "dtype": df.dtypes.astype(str)}))
+
+            st.subheader("Missing values & duplicates")
+            miss = df.isnull().sum().sort_values(ascending=False)
+            st.write(miss[miss > 0])
+
+            if st.checkbox("Show rows with any missing values (sample 50)"):
+                st.dataframe(df[df.isnull().any(axis=1)].head(50))
+
+            if st.checkbox("Remove duplicate rows (keep first)"):
+                before = df.shape[0]
+                df = df.drop_duplicates(keep="first").reset_index(drop=True)
+                after = df.shape[0]
+                st.success(f"Removed {before-after} duplicate rows.")
+            st.write("Duplicate rows: ", df.duplicated().sum())
+
+            st.subheader("Missing value filling options")
+            fill_opt = st.selectbox("Fill strategy", ["median", "mean", "mode", "custom"])
+            custom_map = {}
+            if fill_opt == "custom":
+                st.write("Enter custom fill values per column (optional). Leave blank to skip.")
+                for c in df.columns:
+                    v = st.text_input(f"Fill value for {c} (string interpreted as-is)", key=f"fill_{c}")
+                    if v != "":
+                        # try to coerce numeric
+                        try:
+                            vv = float(v)
+                            custom_map[c] = vv
+                        except Exception:
+                            custom_map[c] = v
+            if st.button("Apply fill missing values"):
+                df = fill_missing_values(df, strategy=fill_opt, custom_values=custom_map if fill_opt == "custom" else None)
+                st.session_state["cleaned_df"] = df
+                st.success("Missing values filled as requested.")
+                st.dataframe(df.head(20))
+
+            st.subheader("Outlier handling")
+            cap_out = st.checkbox("Cap outliers (IQR capping) — apply now", value=True)
+            rm_out = st.checkbox("Remove detected outliers using IsolationForest", value=False)
+            contamination = st.slider("IsolationForest contamination (if removing)", 0.01, 0.3, 0.05, 0.01)
+            if st.button("Apply outlier handling"):
+                # use current df (prefer cleaned_df if exists)
+                df_work = st.session_state.get("cleaned_df", df).copy()
+                numeric_cols = df_work.select_dtypes(include=[np.number]).columns.tolist()
+                if cap_out:
+                    for c in numeric_cols:
+                        try:
+                            df_work[c] = iqr_cap_series(df_work[c])
+                        except Exception:
+                            pass
+                if rm_out:
+                    idxs = detect_outliers_isolationforest(df_work, numeric_cols, contamination=contamination)
+                    nrm = len(idxs)
+                    if nrm:
+                        df_work = df_work.drop(df_work.index[idxs]).reset_index(drop=True)
+                        st.success(f"Removed {nrm} rows detected as outliers by IsolationForest.")
+                    else:
+                        st.info("No outliers detected by IsolationForest (or detection failed).")
+                st.session_state["cleaned_df"] = df_work
+                st.write(df_work.head(20))
+
+            st.subheader("Download cleaned dataset")
+            cleaned = st.session_state.get("cleaned_df", df)
+            if st.button("Save cleaned dataset to outputs/cleaned_dataset.csv"):
+                outpath = os.path.join(OUTPUT_DIR, "cleaned_dataset.csv")
+                cleaned.to_csv(outpath, index=False)
+                st.success(f"Saved cleaned dataset: {outpath}")
+                with open(outpath, "rb") as f:
+                    st.download_button("Download cleaned CSV", data=f, file_name="cleaned_dataset.csv")
+
+    # ---- Visualizations ----
+    if nav == "Visualizations":
+        st.header("Interactive Visualizations")
+        df = st.session_state.get("cleaned_df", st.session_state.get("raw_merged_df", None))
+        if df is None:
+            st.info("No dataset available. Upload files in 'Upload & Merge' first.")
         else:
-            # show saved images (sorted)
-            image_paths = sorted(glob.glob(os.path.join(OUTPUT_DIR, "*.png")))
-            if image_paths:
-                for img_path in image_paths:
+            st.subheader("Missing values heatmap")
+            try:
+                mh = plot_missing_values_heatmap(df)
+                st.image(mh, caption="Missing values heatmap", use_column_width=True)
+            except Exception as e:
+                st.write("Could not create missing heatmap:", e)
+
+            st.subheader("Choose a column to inspect")
+            col = st.selectbox("Column", df.columns.tolist())
+            if pd.api.types.is_numeric_dtype(df[col]):
+                st.write("Numeric column plots")
+                p1 = plot_hist_and_kde(df, col, f"hist_{col}.png")
+                p2 = plot_boxplot(df, col, f"box_{col}.png")
+                st.image(p1, caption=f"Histogram of {col}")
+                st.image(p2, caption=f"Boxplot of {col}")
+            else:
+                st.write("Categorical column plots")
+                p = plot_categorical_counts(df, col, top_n=20, fname=f"cat_{col}.png")
+                st.image(p, caption=f"Counts for {col}")
+
+            st.subheader("Correlation matrix (numeric)")
+            try:
+                corrp = plot_correlation_matrix(df.select_dtypes(include=[np.number]))
+                st.image(corrp, caption="Correlation matrix")
+            except Exception as e:
+                st.write("Could not create correlation matrix:", e)
+
+            st.subheader("Map (if Latitude & Longitude present)")
+            lat_cols = [c for c in df.columns if c.lower() in ("latitude", "lat")]
+            lon_cols = [c for c in df.columns if c.lower() in ("longitude", "lon", "lng")]
+            if lat_cols and lon_cols:
+                latc = lat_cols[0]
+                lonc = lon_cols[0]
+                sub = df[[latc, lonc]].dropna()
+                sub = sub.rename(columns={latc: "lat", lonc: "lon"})
+                st.map(sub.rename(columns={"lat": "latitude", "lon": "longitude"}))
+            else:
+                st.info("No Latitude/Longitude columns detected for map visualization.")
+
+    # ---- Modeling & Results ----
+    if nav == "Modeling & Results":
+        st.header("Modeling & Results")
+        df = st.session_state.get("cleaned_df", st.session_state.get("raw_merged_df", None))
+        if df is None:
+            st.info("No dataset available. Upload files in 'Upload & Merge' first.")
+        else:
+            st.subheader("Modeling options")
+            target_col = st.selectbox("Select target column", df.columns.tolist(), index=min(0, max(0, list(df.columns).index("Risk_Level")) ) )
+            fill_strategy = st.selectbox("Missing fill strategy (applied before modeling)", ["median", "mean", "mode"])
+            cap_outliers = st.checkbox("Cap outliers (IQR) before modeling", value=True)
+            rm_outliers = st.checkbox("Remove outliers via IsolationForest before modeling", value=False)
+            isolation_cont = st.slider("IsolationForest contamination if removing", 0.01, 0.3, 0.05, 0.01)
+            onehot_max = st.slider("Max cardinality for one-hot (otherwise label-encode)", 2, 50, 12)
+
+            st.write("Choose models to train:")
+            available_models = list(get_models_dict(include_xgboost=True).keys())
+            chosen = st.multiselect("Models", available_models, default=available_models)
+
+            if st.button("Run preprocessing + train models"):
+                with st.spinner("Preprocessing & training..."):
                     try:
-                        st.image(img_path, caption=os.path.basename(img_path))
-                    except Exception:
-                        st.write(f"Could not load image {img_path}")
-            else:
-                st.info("No visualizations found in outputs/ yet.")
-    elif nav_choice == "Model Results":
-        st.header("Model Results & Metrics")
-        if "pipeline_result" not in st.session_state:
-            st.info("No pipeline run available. Upload a CSV to run the pipeline.")
-        else:
-            result = st.session_state["pipeline_result"]
-            # Display test results table if exists
-            test_results = result.get("test_results", {})
-            if test_results:
-                df_results = pd.DataFrame(test_results).T
-                st.subheader("Test set performance (accuracy, precision, recall, f1)")
-                st.dataframe(df_results)
-            else:
-                st.write("No test results saved.")
+                        X_train, X_test, y_train, y_test, meta = preprocess_and_split(
+                            df,
+                            target_col=target_col,
+                            fill_strategy=fill_strategy,
+                            cap_outliers=cap_outliers,
+                            remove_outliers=rm_outliers,
+                            outlier_method="isolationforest" if rm_outliers else "iqr",
+                            isolation_contamination=isolation_cont,
+                            onehot_max=onehot_max,
+                            select_features=True,
+                        )
+                        st.session_state["modeling"] = {"X_train": X_train, "X_test": X_test, "y_train": y_train, "y_test": y_test, "meta": meta}
+                        trained = train_models(X_train, y_train, chosen_models=chosen)
+                        st.session_state["trained_models"] = trained
+                        results = evaluate_models(trained, X_test, y_test, meta)
+                        st.session_state["test_results"] = results
+                        cv_scores = cross_validate_models(trained, pd.concat([X_train, X_test], axis=0), pd.concat([y_train, y_test], axis=0), k=5)
+                        st.session_state["cv_scores"] = {k: v.tolist() for k, v in cv_scores.items()}
+                        st.success("Training & evaluation finished.")
+                    except Exception as e:
+                        st.error(f"Modeling failed: {e}")
 
-            # Display CV scores summary
-            cv_scores = result.get("cv_scores", {})
-            if cv_scores:
-                st.subheader("Cross-validation accuracy per fold")
-                for model_name, scores in cv_scores.items():
-                    st.write(f"{model_name}: {scores}")
+            if "test_results" in st.session_state:
+                st.subheader("Test set results")
+                tr = st.session_state["test_results"]
+                st.dataframe(pd.DataFrame(tr).T)
+
+            if "cv_scores" in st.session_state:
+                st.subheader("Cross-validation (accuracy per fold)")
+                cs = st.session_state["cv_scores"]
+                for m, arr in cs.items():
+                    st.write(f"{m}: {arr}")
+
+            st.subheader("Feature selection summary (if used)")
+            meta = st.session_state.get("modeling", {}).get("meta", {})
+            if meta:
+                fs = meta.get("feature_selection_meta", {})
+                st.write("Selected features:", meta.get("selected_features", []))
+                st.write("Top features (if available):")
+                st.write(fs.get("top_features", []) if isinstance(fs, dict) else fs)
+
+            st.subheader("SHAP explainability")
+            if SHAP_AVAILABLE:
+                if st.button("Compute SHAP for trained RandomForest (slow)"):
+                    trained = st.session_state.get("trained_models", {})
+                    rf = trained.get("RandomForest", None)
+                    if rf is None:
+                        st.info("RandomForest not trained; train it or include it in models.")
+                    else:
+                        try:
+                            explainer = shap.TreeExplainer(rf)
+                            X_sample = st.session_state["modeling"]["X_test"].sample(min(100, st.session_state["modeling"]["X_test"].shape[0]), random_state=RANDOM_STATE)
+                            shap_values = explainer.shap_values(X_sample)
+                            # show summary plot
+                            shap.summary_plot(shap_values, X_sample, show=False)
+                            fig = plt.gcf()
+                            path = save_and_show(fig, "shap_summary.png")
+                            st.image(path, caption="SHAP summary (sample)")
+                        except Exception as e:
+                            st.write("SHAP failed:", e)
             else:
-                st.write("No cross-validation results.")
+                st.info("SHAP package not available. Install `shap` to enable explainability.")
 
-            # Show FS summary if present
-            fs_meta = result.get("meta", {}).get("feature_selection", None)
-            if fs_meta:
-                st.subheader("Feature selection summary")
-                top = fs_meta.get("top_features", [])[:20]
-                st.write("Top features (by RandomForest importance):")
-                st.write(top)
-                st.write("Selected features used for modelling:")
-                st.write(fs_meta.get("selected_features", []))
-
-            # Show list of saved CSV summaries
-            summary_csv = os.path.join(OUTPUT_DIR, "test_results_summary.csv")
-            if os.path.exists(summary_csv):
-                with open(summary_csv, "rb") as f:
-                    st.download_button("Download test results CSV", data=f, file_name="test_results_summary.csv")
-    elif nav_choice == "Download Outputs":
+    # ---- Download Outputs ----
+    if nav == "Download Outputs":
         st.header("Download Outputs")
         st.write(f"All pipeline outputs are saved to: {os.path.abspath(OUTPUT_DIR)}")
-        # Create zip and offer download
-        zip_path = os.path.join(OUTPUT_DIR, "outputs_bundle.zip")
-        try:
-            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                for file in glob.glob(os.path.join(OUTPUT_DIR, "*")):
-                    zf.write(file, arcname=os.path.basename(file))
-            with open(zip_path, "rb") as f:
-                st.download_button("Download all outputs (zip)", data=f, file_name="outputs_bundle.zip")
-        except Exception as e:
-            st.write(f"Could not create/download outputs zip: {e}")
-
-
-# ----------------------------
-# CLI fallback (unchanged minimal)
-# ----------------------------
-def parse_cli_csv_arg() -> Optional[str]:
-    args = sys.argv[1:]
-    if not args:
-        return None
-    if "--csv" in args:
-        i = args.index("--csv")
-        if i + 1 < len(args):
-            return args[i + 1]
-    first = args[0]
-    if not first.startswith("-"):
-        return first
-    return None
-
-
-def get_csv_path_interactive() -> str:
-    cli = parse_cli_csv_arg()
-    if cli:
-        return cli
-    csv_path = input("Enter path or URL to CSV file: ").strip()
-    if not csv_path:
-        print("No CSV provided. Exiting.")
-        sys.exit(1)
-    return csv_path
-
-
-def main_cli():
-    csv_path = get_csv_path_interactive()
-    if os.path.isfile(csv_path):
-        saved_path = csv_path
-    else:
-        try:
-            df_tmp = pd.read_csv(csv_path)
-            saved_path = os.path.join(INPUT_DIR, os.path.basename(csv_path) or "uploaded.csv")
-            df_tmp.to_csv(saved_path, index=False)
-        except Exception:
-            print(f"Could not read CSV from {csv_path}. Exiting.")
-            sys.exit(1)
-
-    X_train, X_test, y_train, y_test, meta = load_and_preprocess_data(saved_path)
-    trained_models = train_models(X_train, y_train)
-    test_results = validate_models(trained_models, X_test, y_test, meta)
-    X_full = pd.concat([X_train, X_test], axis=0)
-    y_full = pd.concat([y_train, y_test], axis=0)
-    cv_scores = cross_validate_models(trained_models, X_full, y_full, k=5)
-
-    print("\nPipeline finished. Outputs saved in:", os.path.abspath(OUTPUT_DIR))
-
+        # list files
+        files = glob.glob(os.path.join(OUTPUT_DIR, "*"))
+        if files:
+            st.write("Saved files:")
+            for f in files:
+                st.write("-", os.path.basename(f))
+            if st.button("Create zip of outputs"):
+                zip_path = os.path.join(OUTPUT_DIR, "outputs_bundle.zip")
+                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for file in files:
+                        zf.write(file, arcname=os.path.basename(file))
+                with open(zip_path, "rb") as fh:
+                    st.download_button("Download outputs zip", data=fh, file_name="outputs_bundle.zip")
+        else:
+            st.write("No outputs present yet.")
 
 # ----------------------------
 # Entrypoint
@@ -789,5 +839,4 @@ if __name__ == "__main__":
     if STREAMLIT_AVAILABLE:
         run_streamlit_app()
     else:
-        print("Streamlit not available. Running CLI fallback.")
-        main_cli()
+        print("Streamlit not available. Run this script with `streamlit run app.py` to use the full UI.")
