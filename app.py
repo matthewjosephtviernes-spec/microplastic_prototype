@@ -2,23 +2,19 @@
 """
 feature_selection_and_resampling.py
 
-Usage:
-- Edit the DATA_PATH variable or call load_data(df=your_dataframe).
-- The script expects a column named 'Risk_Type' as the target.
-- Installs required packages if missing: scikit-learn, pandas, numpy, imbalanced-learn, matplotlib, seaborn
+Modified to handle missing imbalanced-learn (imblearn) gracefully.
 
-What it does:
-1. Loads preprocessed dataset (or accepts a DataFrame).
-2. Reports class distribution for 'Risk_Type'.
-3. Runs multiple feature selection methods:
-   - Filter: ANOVA f_classif and mutual_info_classif
-   - Filter (categorical): chi2 (requires non-negative; handled with MinMaxScaler)
-   - Embedded: L1 LogisticRegression (SelectFromModel), RandomForest feature importances (SelectFromModel)
-   - Wrapper: RFE with LogisticRegression
-4. Aggregates top features from each method and shows votes/ranks.
-5. Trains baseline models and evaluates F1-scores (macro/micro) with StratifiedKFold.
-6. Provides resampling helpers (SMOTE, SMOTENC, RandomOverSampler, RandomUnderSampler) and compares results.
-7. Runs GridSearchCV for basic hyperparameter tuning inside a pipeline (including sampling).
+If imbalanced-learn is not installed:
+ - The script will still run feature selection and model evaluation.
+ - Resampling methods (SMOTE, SMOTENC, RandomOverSampler, RandomUnderSampler)
+   and the imblearn Pipeline will be unavailable and attempting to use them
+   will raise a clear error explaining how to enable them.
+
+To enable resampling, install imbalanced-learn:
+    pip install imbalanced-learn
+
+If you're deploying to Streamlit Cloud, add "imbalanced-learn" to requirements.txt
+so the package is installed at deploy time.
 """
 
 import argparse
@@ -42,14 +38,22 @@ from sklearn.pipeline import Pipeline
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-# imbalanced-learn
+# imbalanced-learn (optional)
 try:
     from imblearn.over_sampling import RandomOverSampler, SMOTE, SMOTENC
     from imblearn.under_sampling import RandomUnderSampler
     from imblearn.pipeline import Pipeline as ImbPipeline
-except Exception as e:
-    raise ImportError(
-        "imblearn is required for resampling (pip install imbalanced-learn). Original error: {}".format(e)
+    IMBLEARN_AVAILABLE = True
+except Exception:
+    # Do NOT raise here. Instead, continue but mark unavailability.
+    IMBLEARN_AVAILABLE = False
+    RandomOverSampler = SMOTE = SMOTENC = RandomUnderSampler = ImbPipeline = None
+    print(
+        "Warning: imbalanced-learn is not installed. "
+        "Resampling methods (SMOTE, SMOTENC, RandomOverSampler, RandomUnderSampler) "
+        "and imblearn Pipeline will be unavailable. To enable them install:\n"
+        "    pip install imbalanced-learn\n"
+        "Or add 'imbalanced-learn' to your requirements.txt if deploying (e.g., Streamlit Cloud)."
     )
 
 warnings.filterwarnings("ignore")
@@ -163,11 +167,9 @@ def run_embedded_methods(X: pd.DataFrame, y: pd.Series, top_k: int = TOP_K) -> D
         # coefficients absolute value
         if hasattr(sfm_lr.estimator_, 'coef_'):
             coefs = np.abs(sfm_lr.estimator_.coef_).mean(axis=0)
-            feature_names = X.columns[sfm_lr.estimator_.coef_.shape[1] - len(coefs):] if False else X.columns
             scores = sorted(zip(X.columns, coefs), key=lambda x: -x[1])
             results['l1_logistic'] = scores[:top_k]
         else:
-            # fallback to selected features only
             sel = X.columns[sfm_lr.get_support()]
             results['l1_logistic'] = [(f, 1.0) for f in sel[:top_k]]
     except Exception as e:
@@ -266,8 +268,16 @@ def resample_data(X: pd.DataFrame, y: pd.Series, method: str = 'none', categoric
       - 'smotenc' : SMOTENC (for datasets with categorical_features indices)
     categorical_features: list of column names which are categorical (required for smotenc)
     """
+    method = method.lower()
     if method == 'none':
         return X, y
+
+    # Ensure imblearn is available for resampling methods
+    if not IMBLEARN_AVAILABLE:
+        raise ImportError(
+            f"Requested resampling method '{method}' but imbalanced-learn (imblearn) is not installed. "
+            "Install it with: pip install imbalanced-learn or add it to your deployment requirements."
+        )
 
     if method == 'oversample':
         ros = RandomOverSampler(random_state=RANDOM_STATE)
@@ -303,29 +313,36 @@ def tune_model_with_resampling(X: pd.DataFrame, y: pd.Series, sampler: Optional[
     sampler: 'none', 'oversample', 'smote', 'smotenc'
     Returns fitted gridsearch (for last estimator) and best_params summary.
     """
-    # Example grid for RandomForest
+    if sampler and sampler != 'none' and not IMBLEARN_AVAILABLE:
+        raise ImportError(
+            f"Requested sampler '{sampler}' in tuning pipeline but imbalanced-learn is not installed. "
+            "Install it with: pip install imbalanced-learn or add it to your deployment requirements."
+        )
+
+    # Build sampler object if requested
+    sampler_obj = None
     if sampler and sampler != 'none':
-        if sampler == 'oversample':
+        s = sampler.lower()
+        if s == 'oversample':
             sampler_obj = RandomOverSampler(random_state=RANDOM_STATE)
-        elif sampler == 'smote':
+        elif s == 'smote':
             sampler_obj = SMOTE(random_state=RANDOM_STATE)
-        elif sampler == 'smotenc':
+        elif s == 'smotenc':
             if not categorical_features:
                 raise ValueError("Pass categorical_features for smotenc")
             cat_idx = [list(X.columns).index(c) for c in categorical_features]
             sampler_obj = SMOTENC(categorical_features=cat_idx, random_state=RANDOM_STATE)
         else:
-            sampler_obj = None
-    else:
-        sampler_obj = None
+            raise ValueError("Unknown sampler requested: " + sampler)
 
-    pipe_steps = []
+    # Use imblearn Pipeline if available and sampler is present, otherwise sklearn Pipeline
     if sampler_obj is not None:
-        pipe_steps.append(('sampler', sampler_obj))
-    pipe_steps.append(('scaler', StandardScaler()))
-    pipe_steps.append(('clf', RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=N_JOBS)))
-
-    pipeline = ImbPipeline(pipe_steps)
+        if not IMBLEARN_AVAILABLE:
+            raise ImportError("imblearn pipeline required but imbalanced-learn is not installed.")
+        pipe_steps = [('sampler', sampler_obj), ('scaler', StandardScaler()), ('clf', RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=N_JOBS))]
+        pipeline = ImbPipeline(pipe_steps)
+    else:
+        pipeline = Pipeline([('scaler', StandardScaler()), ('clf', RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=N_JOBS))])
 
     param_grid = {
         'clf__n_estimators': [100, 300],
@@ -385,12 +402,14 @@ def demo_flow(path: Optional[str] = None, df: Optional[pd.DataFrame] = None):
     eval_results_all = evaluate_models(X, y, feature_subset=None, cv_splits=5)
 
     # Investigate class imbalance and resampling
-    print("\nComparing resampling strategies (oversample, undersample, smote, smotenc if categorical available):")
+    print("\nComparing resampling strategies (none, oversample, undersample, smote, smotenc if available):")
     resample_methods = ['none', 'oversample', 'undersample']
-    if len(num_cols) > 0:
+    if IMBLEARN_AVAILABLE and len(num_cols) > 0:
         resample_methods.append('smote')
-    if len(cat_cols) > 0:
+    if IMBLEARN_AVAILABLE and len(cat_cols) > 0:
         resample_methods.append('smotenc')
+    if not IMBLEARN_AVAILABLE:
+        print("Note: imbalanced-learn not available; skipping SMOTE/SMOTENC/imbalanced pipelines. Install imbalanced-learn to enable them.")
 
     resample_summary = {}
     for method in resample_methods:
@@ -406,10 +425,14 @@ def demo_flow(path: Optional[str] = None, df: Optional[pd.DataFrame] = None):
         except Exception as e:
             print("Resampling failed for method", method, "error:", e)
 
-    # Example hyperparameter tuning with resampling in pipeline
-    print("\nRunning GridSearchCV with RandomOverSampler + RandomForest (this may take a while)...")
+    # Example hyperparameter tuning with resampling in pipeline (only if imblearn available or sampler is 'none')
+    print("\nRunning GridSearchCV with Optional Resampling + RandomForest (this may take a while)...")
     try:
-        gs, gs_summary = tune_model_with_resampling(X[top_features], y, sampler='oversample', categorical_features=cat_cols)
+        if IMBLEARN_AVAILABLE:
+            gs, gs_summary = tune_model_with_resampling(X[top_features], y, sampler='oversample', categorical_features=cat_cols)
+        else:
+            print("imblearn not available: running GridSearchCV without resampling sampler")
+            gs, gs_summary = tune_model_with_resampling(X[top_features], y, sampler='none', categorical_features=cat_cols)
     except Exception as e:
         print("GridSearchCV failed:", e)
         gs_summary = {}
