@@ -1,6 +1,6 @@
 # app.py
 # Streamlit app: Predictive Risk Modeling for Microplastic Pollution
-# Pages are shown as separate "windows" using Streamlit tabs (top-level).
+# Steps are shown as separate "windows" using Streamlit tabs.
 
 import re
 import numpy as np
@@ -21,7 +21,7 @@ from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, RandomForestRegressor
 from sklearn.inspection import permutation_importance
 
-# Optional: SMOTE (handle gracefully if not installed)
+# Optional: SMOTE
 try:
     from imblearn.over_sampling import SMOTE
     from imblearn.pipeline import Pipeline as ImbPipeline
@@ -147,42 +147,62 @@ def ensure_session_defaults():
 
 
 # -----------------------------
+# Robust CSV loader (fixes UTF-8 decode issue)
+# -----------------------------
+@st.cache_data
+def load_data(uploaded):
+    def _read_csv(file_obj):
+        encodings = ["utf-8", "utf-8-sig", "cp1252", "latin1"]
+        last_err = None
+        for enc in encodings:
+            try:
+                if hasattr(file_obj, "seek"):
+                    file_obj.seek(0)
+                # sep=None + engine="python" helps auto-detect delimiter (comma/semicolon/etc.)
+                df_ = pd.read_csv(file_obj, encoding=enc, sep=None, engine="python")
+                return df_, enc
+            except Exception as e:
+                last_err = e
+        raise last_err
+
+    if uploaded is not None:
+        df0, enc = _read_csv(uploaded)
+        src = f"Uploaded CSV (encoding: {enc})"
+    else:
+        df0, enc = _read_csv("Microplastic.csv")
+        src = f"Local file: Microplastic.csv (encoding: {enc})"
+
+    df0 = clean_dataframe(df0)
+    return df0, src
+
+
+# -----------------------------
 # UI
 # -----------------------------
 st.set_page_config(page_title="Microplastic Risk Modeling", layout="wide")
 ensure_session_defaults()
 
 st.title("Predictive Risk Modeling for Microplastic Pollution (Data Mining)")
-st.caption("A step-by-step interactive workflow: upload → explore → preprocess → handle imbalance → train → validate → compare → explain → predict.")
+st.caption("Step-by-step workflow: upload → explore → preprocess → imbalance → train → validate/compare → explain → predict.")
 
 
-# ✅ TOP VISIBLE UPLOAD SECTION
+# Top upload section (always visible)
 st.markdown("## Upload Dataset")
-st.write("Upload a CSV file to start. If you don’t upload, the app will try to load **Microplastic.csv** from the app folder.")
+st.write("Upload a CSV file. If you don’t upload, the app will try to load **Microplastic.csv** from the app folder.")
 uploaded_file = st.file_uploader("Upload your dataset (.csv)", type=["csv"])
-
-@st.cache_data
-def load_data(uploaded):
-    if uploaded is not None:
-        df0 = pd.read_csv(uploaded)
-        src = "Uploaded CSV"
-    else:
-        df0 = pd.read_csv("Microplastic.csv")
-        src = "Local file: Microplastic.csv"
-    df0 = clean_dataframe(df0)
-    return df0, src
-
 
 try:
     df, data_src = load_data(uploaded_file)
     st.success(f"Loaded data source: **{data_src}**")
 except Exception as e:
-    st.error(f"Could not load dataset. Upload a CSV or make sure Microplastic.csv exists. Error: {e}")
+    st.error(f"Could not load dataset. Upload a CSV or make sure Microplastic.csv exists.\n\nError: {e}")
     st.stop()
+
+st.divider()
 
 
 # -----------------------------
-# GLOBAL CONTROLS (visible on every "window")
+# Configuration (visible on every tab)
 # -----------------------------
 st.markdown("## Configuration")
 cfg1, cfg2, cfg3 = st.columns([1.1, 1.1, 1.2])
@@ -228,7 +248,7 @@ with cfg3:
             default=["Logistic Regression", "Random Forest", "Gradient Boosting"]
         )
 
-# Task / target col
+# Determine task/target_col
 if target_choice.startswith("Risk_Type"):
     target_col = "Risk_Type"
     task = "classification"
@@ -239,7 +259,7 @@ else:
     target_col = "Risk_Level_std"
     task = "classification"
 
-# Features
+# Feature selection
 st.markdown("### Input Features")
 default_drop = [c for c in ["Risk_Type", "Risk_Score", "Risk_Level", "Risk_Level_std"] if c in df.columns]
 feature_cols = st.multiselect(
@@ -247,8 +267,7 @@ feature_cols = st.multiselect(
     options=[c for c in df.columns if c not in default_drop],
     default=[c for c in df.columns if c not in default_drop]
 )
-
-if len(feature_cols) == 0:
+if not feature_cols:
     st.error("Please select at least one feature column.")
     st.stop()
 
@@ -260,16 +279,11 @@ y = data[target_col].copy()
 # Split
 if task == "classification":
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y,
-        test_size=test_size,
-        random_state=random_state,
-        stratify=y
+        X, y, test_size=test_size, random_state=random_state, stratify=y
     )
 else:
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y,
-        test_size=test_size,
-        random_state=random_state
+        X, y, test_size=test_size, random_state=random_state
     )
 
 preprocessor, num_cols, cat_cols = build_preprocessor(X_train)
@@ -278,12 +292,12 @@ st.divider()
 
 
 # -----------------------------
-# WINDOWS / STEPS AS TABS
+# Tabs as separate "windows"
 # -----------------------------
 tabs = st.tabs([
     "1) Explore",
     "2) Prepare",
-    "3) Imbalance (SMOTE)",
+    "3) Imbalance",
     "4) Train",
     "5) Validate & Compare",
     "6) Feature Relevance",
@@ -452,16 +466,14 @@ with tabs[4]:
         else:
             st.json(metric_table_regression(y_test, best_pred))
 
-        # Cross-validation
-        st.subheader("Cross-validation (to check generalizability)")
-        st.caption("Uses StratifiedKFold for classification; standard KFold-like behavior via StratifiedKFold is not used for regression here.")
-
-        run_cv = st.button("Run cross-validation (CV)", help="Computes CV scores for each trained model.")
-        if run_cv:
-            cv_rows = []
-            if task == "classification":
+        st.subheader("Cross-validation (generalizability check)")
+        if task != "classification":
+            st.info("This demo runs CV only for classification. If you want regression CV, tell me and I'll add it.")
+        else:
+            if st.button("Run cross-validation (5-fold StratifiedKFold)"):
                 cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
                 scoring = "f1_macro"
+                cv_rows = []
                 for name, pipe in models.items():
                     scores = cross_val_score(pipe, X, y, cv=cv, scoring=scoring)
                     cv_rows.append({
@@ -472,20 +484,9 @@ with tabs[4]:
                         "min": float(np.min(scores)),
                         "max": float(np.max(scores)),
                     })
-            else:
-                # For regression, use R2 as CV score (simple & interpretable)
-                cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
-                # NOTE: StratifiedKFold isn't appropriate for continuous y; keeping it simple:
-                # We'll do repeated random split style is overkill; so we skip CV by default.
-                cv_rows.append({
-                    "model": "(regression)",
-                    "cv_metric": "N/A",
-                    "mean": np.nan, "std": np.nan, "min": np.nan, "max": np.nan
-                })
-
-            cv_df = pd.DataFrame(cv_rows)
-            st.session_state["cv_results"] = cv_df
-            st.dataframe(cv_df, use_container_width=True)
+                cv_df = pd.DataFrame(cv_rows).sort_values("mean", ascending=False)
+                st.session_state["cv_results"] = cv_df
+                st.dataframe(cv_df, use_container_width=True)
 
 # 6) Feature relevance
 with tabs[5]:
@@ -497,7 +498,7 @@ with tabs[5]:
         st.warning("No best model selected yet. Train and evaluate in **Validate & Compare** first.")
     else:
         st.write(f"Using best model: **{best_model_name}**")
-        st.caption("Permutation importance is model-agnostic. It measures the drop in score when a feature is shuffled.")
+        st.caption("Permutation importance measures the drop in score when a feature is shuffled.")
 
         if st.button("Compute permutation importance", type="primary"):
             scoring = "f1_macro" if task == "classification" else "r2"
@@ -512,7 +513,6 @@ with tabs[5]:
                 "importance_mean": perm.importances_mean,
                 "importance_std": perm.importances_std
             }).sort_values("importance_mean", ascending=False)
-
             st.session_state["feature_importance"] = importances
 
         importances = st.session_state.get("feature_importance", None)
@@ -520,7 +520,6 @@ with tabs[5]:
             st.info("Click **Compute permutation importance** to generate results.")
         else:
             st.dataframe(importances.head(20), use_container_width=True)
-
             fig, ax = plt.subplots()
             top = importances.head(15)
             ax.bar(top["feature"].astype(str), top["importance_mean"].values)
@@ -541,7 +540,6 @@ with tabs[6]:
         st.write(f"Best model: **{best_model_name}**")
         st.caption("Fill in the inputs below and the model will generate a prediction.")
 
-        # Build inputs
         with st.form("predict_form"):
             user_row = {}
             col_left, col_right = st.columns(2)
