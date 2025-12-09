@@ -1,467 +1,504 @@
-#!/usr/bin/env python3
-"""
-feature_selection_and_resampling.py
-
-Modified to handle missing imbalanced-learn (imblearn) gracefully.
-
-If imbalanced-learn is not installed:
- - The script will still run feature selection and model evaluation.
- - Resampling methods (SMOTE, SMOTENC, RandomOverSampler, RandomUnderSampler)
-   and the imblearn Pipeline will be unavailable and attempting to use them
-   will raise a clear error explaining how to enable them.
-
-To enable resampling, install imbalanced-learn:
-    pip install imbalanced-learn
-
-If you're deploying to Streamlit Cloud, add "imbalanced-learn" to requirements.txt
-so the package is installed at deploy time.
-"""
-
-import argparse
-import warnings
-from collections import Counter, defaultdict
-from typing import Optional, Tuple, List, Dict
-
+import re
 import numpy as np
 import pandas as pd
+import streamlit as st
 
-# sklearn
-from sklearn.model_selection import StratifiedKFold, cross_val_score, GridSearchCV, train_test_split
-from sklearn.preprocessing import LabelEncoder, StandardScaler, MinMaxScaler
-from sklearn.feature_selection import SelectKBest, f_classif, mutual_info_classif, chi2, SelectFromModel, RFE
-from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import classification_report, f1_score, confusion_matrix
+from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (
+    classification_report, confusion_matrix, ConfusionMatrixDisplay,
+    accuracy_score, f1_score, balanced_accuracy_score,
+    mean_absolute_error, mean_squared_error, r2_score
+)
+from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, RandomForestRegressor
+from sklearn.inspection import permutation_importance
 
-# visualization
-import matplotlib.pyplot as plt
-import seaborn as sns
-
-# imbalanced-learn (optional)
+# Optional: SMOTE (handle gracefully if not installed)
 try:
-    from imblearn.over_sampling import RandomOverSampler, SMOTE, SMOTENC
-    from imblearn.under_sampling import RandomUnderSampler
+    from imblearn.over_sampling import SMOTE
     from imblearn.pipeline import Pipeline as ImbPipeline
-    IMBLEARN_AVAILABLE = True
+    IMBLEARN_OK = True
 except Exception:
-    # Do NOT raise here. Instead, continue but mark unavailability.
-    IMBLEARN_AVAILABLE = False
-    RandomOverSampler = SMOTE = SMOTENC = RandomUnderSampler = ImbPipeline = None
-    print(
-        "Warning: imbalanced-learn is not installed. "
-        "Resampling methods (SMOTE, SMOTENC, RandomOverSampler, RandomUnderSampler) "
-        "and imblearn Pipeline will be unavailable. To enable them install:\n"
-        "    pip install imbalanced-learn\n"
-        "Or add 'imbalanced-learn' to your requirements.txt if deploying (e.g., Streamlit Cloud)."
+    IMBLEARN_OK = False
+
+import matplotlib.pyplot as plt
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def parse_numeric_with_units(x):
+    """Extract first numeric value from strings like '33 ppt' or '33 PSU'."""
+    if pd.isna(x):
+        return np.nan
+    if isinstance(x, (int, float, np.integer, np.floating)):
+        return float(x)
+    s = str(x).strip()
+    m = re.search(r"[-+]?\d*\.?\d+", s)
+    return float(m.group(0)) if m else np.nan
+
+
+def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [c.strip() for c in df.columns]
+
+    # Parse columns that sometimes include units / text
+    for col in ["Salinity", "MP_Count_per_L", "Microplastic_Size_mm", "Density", "pH"]:
+        if col in df.columns:
+            df[col] = df[col].apply(parse_numeric_with_units)
+
+    for col in ["Latitude", "Longitude"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Standardize Risk_Level into a clean label (optional)
+    if "Risk_Level" in df.columns:
+        def map_level(x):
+            xl = str(x).strip().lower()
+            if "extreme" in xl or "level v" in xl:
+                return "Extreme"
+            if "high" in xl:
+                return "High"
+            if "medium" in xl or "moderate" in xl:
+                return "Medium"
+            if "low" in xl:
+                return "Low"
+            return "Other"
+        df["Risk_Level_std"] = df["Risk_Level"].apply(map_level)
+
+    return df
+
+
+def build_preprocessor(X: pd.DataFrame):
+    numeric_cols = X.select_dtypes(include=["number"]).columns.tolist()
+    categorical_cols = [c for c in X.columns if c not in numeric_cols]
+
+    numeric_pipe = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
+    ])
+
+    cat_pipe = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore")),
+    ])
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("num", numeric_pipe, numeric_cols),
+            ("cat", cat_pipe, categorical_cols),
+        ],
+        remainder="drop"
+    )
+    return preprocessor, numeric_cols, categorical_cols
+
+
+def plot_bar_counts(series, title):
+    counts = series.value_counts(dropna=False).head(25)
+    fig, ax = plt.subplots()
+    ax.bar(counts.index.astype(str), counts.values)
+    ax.set_title(title)
+    ax.set_xlabel(series.name)
+    ax.set_ylabel("Count")
+    plt.xticks(rotation=45, ha="right")
+    st.pyplot(fig)
+
+
+def plot_conf_mat(y_true, y_pred, labels=None, title="Confusion Matrix"):
+    fig, ax = plt.subplots()
+    cm = confusion_matrix(y_true, y_pred, labels=labels)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=labels)
+    disp.plot(ax=ax, xticks_rotation=45, colorbar=False)
+    ax.set_title(title)
+    st.pyplot(fig)
+
+
+def metric_table_classification(y_true, y_pred):
+    return {
+        "accuracy": accuracy_score(y_true, y_pred),
+        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+        "f1_macro": f1_score(y_true, y_pred, average="macro"),
+        "f1_weighted": f1_score(y_true, y_pred, average="weighted"),
+    }
+
+
+def metric_table_regression(y_true, y_pred):
+    return {
+        "MAE": mean_absolute_error(y_true, y_pred),
+        "RMSE": mean_squared_error(y_true, y_pred, squared=False),
+        "R2": r2_score(y_true, y_pred),
+    }
+
+
+# -----------------------------
+# Streamlit UI
+# -----------------------------
+st.set_page_config(page_title="Microplastic Risk Modeling", layout="wide")
+st.title("Predictive Risk Modeling for Microplastic Pollution (Data Mining)")
+
+# ✅ TOP VISIBLE UPLOAD SECTION
+st.markdown("## Upload Dataset")
+st.write("Upload a CSV file to start. If you don’t upload, the app will try to load **Microplastic.csv** from the app folder.")
+uploaded_file = st.file_uploader("Upload your dataset (.csv)", type=["csv"])
+
+@st.cache_data
+def load_data(uploaded):
+    if uploaded is not None:
+        df0 = pd.read_csv(uploaded)
+        src = "Uploaded CSV"
+    else:
+        df0 = pd.read_csv("Microplastic.csv")
+        src = "Local file: Microplastic.csv"
+    df0 = clean_dataframe(df0)
+    return df0, src
+
+try:
+    df, data_src = load_data(uploaded_file)
+    st.success(f"Loaded data source: **{data_src}**")
+except Exception as e:
+    st.error(f"Could not load dataset. Upload a CSV or make sure Microplastic.csv exists. Error: {e}")
+    st.stop()
+
+st.divider()
+
+# Sidebar navigation + controls
+st.sidebar.header("Navigation")
+page = st.sidebar.radio(
+    "Go to",
+    [
+        "1) Load & Explore Data",
+        "2) Prepare & Preprocess",
+        "3) Class Imbalance (SMOTE)",
+        "4) Train Models",
+        "5) Evaluate & Compare",
+        "6) Feature Relevance",
+        "7) Final Model + Prediction",
+        "8) Summary of Findings",
+    ]
+)
+
+# Target selection
+st.sidebar.header("Model Target")
+target_choice = st.sidebar.selectbox(
+    "Choose prediction target",
+    options=[
+        "Risk_Type (Classification)",
+        "Risk_Score (Regression)",
+        "Risk_Level_std (Classification, cleaned)",
+    ],
+    index=0 if "Risk_Type" in df.columns else 1
+)
+
+if target_choice.startswith("Risk_Type"):
+    target_col = "Risk_Type"
+    task = "classification"
+elif target_choice.startswith("Risk_Score"):
+    target_col = "Risk_Score"
+    task = "regression"
+else:
+    target_col = "Risk_Level_std"
+    task = "classification"
+
+# Features
+default_drop = [c for c in ["Risk_Type", "Risk_Score", "Risk_Level", "Risk_Level_std"] if c in df.columns]
+st.sidebar.header("Features")
+feature_cols = st.sidebar.multiselect(
+    "Select feature columns (inputs)",
+    options=[c for c in df.columns if c not in default_drop],
+    default=[c for c in df.columns if c not in default_drop]
+)
+
+# Split settings
+st.sidebar.header("Train/Test Split")
+test_size = st.sidebar.slider("Test size", 0.1, 0.4, 0.2, 0.05)
+random_state = st.sidebar.number_input("Random state", value=42, step=1)
+
+# SMOTE
+use_smote = False
+if task == "classification":
+    st.sidebar.header("Imbalance Handling")
+    use_smote = st.sidebar.checkbox(
+        "Use SMOTE (training only)",
+        value=False,
+        help="Requires imbalanced-learn. Applied only inside the training pipeline."
     )
 
-warnings.filterwarnings("ignore")
-sns.set(style="whitegrid")
+# Models
+st.sidebar.header("Models")
+if task == "classification":
+    chosen_models = st.sidebar.multiselect(
+        "Choose models",
+        options=["Logistic Regression", "Random Forest", "Gradient Boosting"],
+        default=["Logistic Regression", "Random Forest", "Gradient Boosting"]
+    )
+else:
+    chosen_models = st.sidebar.multiselect(
+        "Choose models",
+        options=["Ridge Regression", "Random Forest Regressor"],
+        default=["Ridge Regression", "Random Forest Regressor"]
+    )
 
-# ---------- Configuration ----------
-DATA_PATH = "preprocessed_data.csv"  # change to your preprocessed csv path or pass a df to load_data()
-TARGET_COL = "Risk_Type"
-RANDOM_STATE = 42
-N_JOBS = -1
-TOP_K = 20  # top features to display from each method
-# -----------------------------------
+# Prepare X, y
+data = df.dropna(subset=[target_col]).copy()
+X = data[feature_cols].copy()
+y = data[target_col].copy()
 
+# Split
+if task == "classification":
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y,
+        test_size=test_size,
+        random_state=random_state,
+        stratify=y
+    )
+else:
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y,
+        test_size=test_size,
+        random_state=random_state
+    )
 
-def load_data(path: Optional[str] = None, df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
-    """
-    Load dataset from CSV or accept a DataFrame directly.
-    Ensures TARGET_COL exists.
-    """
-    if df is not None:
-        data = df.copy()
-    elif path is not None:
-        data = pd.read_csv(path)
+preprocessor, num_cols, cat_cols = build_preprocessor(X_train)
+
+# -----------------------------
+# Pages
+# -----------------------------
+if page.startswith("1)"):
+    st.subheader("1) Load & Explore Data")
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        st.write("Preview (first 20 rows):")
+        st.dataframe(df.head(20), use_container_width=True)
+    with c2:
+        st.write("Shape:")
+        st.write(df.shape)
+        st.write("Target:")
+        st.write({"task": task, "target_col": target_col})
+
+    st.markdown("### Target distribution")
+    if task == "classification":
+        plot_bar_counts(df[target_col].dropna(), f"Distribution of {target_col}")
     else:
-        raise ValueError("Provide either path or df")
+        st.write(df[target_col].describe())
 
-    if TARGET_COL not in data.columns:
-        raise ValueError(f"Target column '{TARGET_COL}' not found in data. Columns: {data.columns.tolist()}")
+    st.markdown("### Polymer Type distribution")
+    if "Polymer_Type" in df.columns:
+        plot_bar_counts(df["Polymer_Type"].dropna(), "Polymer_Type Distribution (Top 25)")
 
-    return data
+elif page.startswith("2)"):
+    st.subheader("2) Prepare & Preprocess")
+    st.markdown("""
+This step shows:
+- cleaning unit-like fields (e.g., salinity values such as '33 PSU' → numeric)
+- imputing missing values
+- one-hot encoding categorical features
+- scaling numeric features (needed for LR/Ridge)
+""")
+    st.write("Selected features:")
+    st.write(feature_cols)
 
+    st.write("Numeric columns detected:")
+    st.write(num_cols)
 
-def show_class_distribution(y: pd.Series, plot: bool = True) -> None:
-    counts = y.value_counts()
-    print("Class distribution (counts):")
-    print(counts)
-    print("\nClass distribution (percent):")
-    print((counts / counts.sum() * 100).round(2))
+    st.write("Categorical columns detected:")
+    st.write(cat_cols)
 
-    if plot:
-        plt.figure(figsize=(8, 4))
-        sns.barplot(x=counts.index.astype(str), y=counts.values)
-        plt.title("Risk_Type class distribution")
-        plt.ylabel("Count")
-        plt.xlabel("Risk_Type")
-        plt.show()
+    st.markdown("### Missing values in selected features")
+    miss = X.isna().sum().sort_values(ascending=False)
+    st.dataframe(miss[miss > 0].to_frame("missing_count"), use_container_width=True)
 
-
-def split_features_target(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
-    X = df.drop(columns=[TARGET_COL])
-    y = df[TARGET_COL].copy()
-    # encode target if needed
-    if y.dtype == object or y.dtype.name == "category":
-        le = LabelEncoder()
-        y = pd.Series(le.fit_transform(y), index=y.index, name=y.name)
-        # store mapping if you need
-        print("Target label mapping:", dict(zip(le.classes_, le.transform(le.classes_))))
-    return X, y
-
-
-def identify_column_types(X: pd.DataFrame) -> Tuple[List[str], List[str]]:
-    num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
-    cat_cols = X.select_dtypes(exclude=[np.number]).columns.tolist()
-    print(f"Identified {len(num_cols)} numeric columns and {len(cat_cols)} categorical columns.")
-    return num_cols, cat_cols
-
-
-def run_filter_methods(X: pd.DataFrame, y: pd.Series, num_cols: List[str], cat_cols: List[str], top_k: int = TOP_K) -> Dict[str, List[Tuple[str, float]]]:
-    results = {}
-
-    if len(num_cols) > 0:
-        # ANOVA f_classif (numerical inputs)
-        skb_f = SelectKBest(score_func=f_classif, k=min(top_k, len(num_cols)))
-        skb_f.fit(X[num_cols], y)
-        scores_f = sorted(zip(num_cols, skb_f.scores_), key=lambda x: -np.nan_to_num(x[1]))
-        results['f_classif'] = scores_f[:top_k]
-
-        # mutual_info_classif
-        skb_mi = SelectKBest(score_func=mutual_info_classif, k=min(top_k, len(num_cols)))
-        skb_mi.fit(X[num_cols], y)
-        scores_mi = sorted(zip(num_cols, skb_mi.scores_), key=lambda x: -np.nan_to_num(x[1]))
-        results['mutual_info'] = scores_mi[:top_k]
+elif page.startswith("3)"):
+    st.subheader("3) Address Class Imbalance (SMOTE)")
+    if task != "classification":
+        st.info("SMOTE is only relevant for classification targets.")
     else:
-        results['f_classif'] = []
-        results['mutual_info'] = []
+        st.write("Class distribution in training set:")
+        st.dataframe(y_train.value_counts().to_frame("count"), use_container_width=True)
 
-    if len(cat_cols) > 0:
-        # chi2 requires non-negative data, we'll MinMax scale categorical encoded as integers or one-hot
-        # Try label-encoding categories into integer codes (works if they are ordinal-ish)
-        X_cat_encoded = X[cat_cols].apply(lambda col: col.astype('category').cat.codes)
-        scaler = MinMaxScaler()
-        X_cat_scaled = scaler.fit_transform(X_cat_encoded.fillna(0))
-        skb_chi = SelectKBest(score_func=chi2, k=min(top_k, len(cat_cols)))
-        skb_chi.fit(X_cat_scaled, y)
-        scores_chi = sorted(zip(cat_cols, skb_chi.scores_), key=lambda x: -np.nan_to_num(x[1]))
-        results['chi2_categorical'] = scores_chi[:top_k]
+        if use_smote:
+            if not IMBLEARN_OK:
+                st.error("imbalanced-learn is not installed, so SMOTE cannot run. Install: pip install imbalanced-learn")
+            else:
+                st.success("SMOTE is enabled. It will be applied ONLY inside the training pipeline (no leakage).")
+        else:
+            st.warning("SMOTE is OFF. Logistic Regression will still use class_weight='balanced'.")
+
+elif page.startswith("4)"):
+    st.subheader("4) Train the Models")
+    st.write(f"Task: **{task}**, Target: **{target_col}**")
+    st.write(f"Training rows: {len(X_train)}, Test rows: {len(X_test)}")
+
+    st.session_state["trained_models"] = {}
+
+    if st.button("Train now"):
+        for name in chosen_models:
+            if task == "classification":
+                if name == "Logistic Regression":
+                    model = LogisticRegression(max_iter=2000, class_weight="balanced")
+                elif name == "Random Forest":
+                    model = RandomForestClassifier(n_estimators=300, random_state=random_state)
+                else:
+                    model = GradientBoostingClassifier(random_state=random_state)
+
+                if use_smote and IMBLEARN_OK:
+                    pipe = ImbPipeline(steps=[
+                        ("preprocess", preprocessor),
+                        ("smote", SMOTE(random_state=random_state)),
+                        ("model", model),
+                    ])
+                else:
+                    pipe = Pipeline(steps=[
+                        ("preprocess", preprocessor),
+                        ("model", model),
+                    ])
+
+                pipe.fit(X_train, y_train)
+                st.session_state["trained_models"][name] = pipe
+
+            else:
+                if name == "Ridge Regression":
+                    model = Ridge(random_state=random_state)
+                else:
+                    model = RandomForestRegressor(n_estimators=400, random_state=random_state)
+
+                pipe = Pipeline(steps=[
+                    ("preprocess", preprocessor),
+                    ("model", model),
+                ])
+                pipe.fit(X_train, y_train)
+                st.session_state["trained_models"][name] = pipe
+
+        st.success("Training complete. Go to **Evaluate & Compare**.")
+
+elif page.startswith("5)"):
+    st.subheader("5) Evaluate & Compare Model Performance")
+    models = st.session_state.get("trained_models", {})
+
+    if not models:
+        st.warning("No trained models yet. Go to **Train Models** and click Train.")
     else:
-        results['chi2_categorical'] = []
+        results = []
+        for name, pipe in models.items():
+            y_pred = pipe.predict(X_test)
 
-    return results
+            if task == "classification":
+                results.append({"model": name, **metric_table_classification(y_test, y_pred)})
+            else:
+                results.append({"model": name, **metric_table_regression(y_test, y_pred)})
 
+        sort_col = "f1_macro" if task == "classification" else "RMSE"
+        res_df = pd.DataFrame(results).sort_values(by=sort_col, ascending=(task != "classification"))
+        st.dataframe(res_df, use_container_width=True)
 
-def run_embedded_methods(X: pd.DataFrame, y: pd.Series, top_k: int = TOP_K) -> Dict[str, List[Tuple[str, float]]]:
-    results = {}
+        best_model_name = res_df.iloc[0]["model"]
+        best_pipe = models[best_model_name]
+        st.session_state["best_model_name"] = best_model_name
+        st.session_state["best_pipe"] = best_pipe
 
-    # L1 Logistic Regression (sparse) - good for linear relationships
-    try:
-        lr = LogisticRegression(penalty='l1', solver='saga', max_iter=5000, random_state=RANDOM_STATE, class_weight='balanced')
-        sfm_lr = SelectFromModel(lr, max_features=top_k)
-        sfm_lr.fit(X.fillna(0), y)
-        # coefficients absolute value
-        if hasattr(sfm_lr.estimator_, 'coef_'):
-            coefs = np.abs(sfm_lr.estimator_.coef_).mean(axis=0)
-            scores = sorted(zip(X.columns, coefs), key=lambda x: -x[1])
-            results['l1_logistic'] = scores[:top_k]
+        st.markdown(f"### Best model (by **{sort_col}**): **{best_model_name}**")
+
+        st.markdown("### Detailed evaluation (best model)")
+        best_pred = best_pipe.predict(X_test)
+
+        if task == "classification":
+            labels = sorted(pd.Series(y_test).unique().tolist())
+            plot_conf_mat(y_test, best_pred, labels=labels, title=f"Confusion Matrix: {best_model_name}")
+            st.text(classification_report(y_test, best_pred, zero_division=0))
         else:
-            sel = X.columns[sfm_lr.get_support()]
-            results['l1_logistic'] = [(f, 1.0) for f in sel[:top_k]]
-    except Exception as e:
-        print("L1 logistic failed:", e)
-        results['l1_logistic'] = []
+            st.json(metric_table_regression(y_test, best_pred))
 
-    # RandomForest feature importances
-    try:
-        rf = RandomForestClassifier(n_estimators=500, random_state=RANDOM_STATE, n_jobs=N_JOBS, class_weight='balanced')
-        rf.fit(X.fillna(0), y)
-        importances = rf.feature_importances_
-        scores_rf = sorted(zip(X.columns, importances), key=lambda x: -x[1])
-        results['random_forest'] = scores_rf[:top_k]
-    except Exception as e:
-        print("RandomForest embedded method failed:", e)
-        results['random_forest'] = []
+elif page.startswith("6)"):
+    st.subheader("6) Analyze Feature Relevance")
+    best_pipe = st.session_state.get("best_pipe", None)
+    best_model_name = st.session_state.get("best_model_name", None)
 
-    return results
-
-
-def run_wrapper_methods(X: pd.DataFrame, y: pd.Series, top_k: int = TOP_K) -> Dict[str, List[Tuple[str, float]]]:
-    results = {}
-    # RFE with logistic regression
-    try:
-        lr = LogisticRegression(penalty='l2', solver='liblinear', max_iter=2000, random_state=RANDOM_STATE, class_weight='balanced')
-        n_features_to_select = min(top_k, X.shape[1])
-        rfe = RFE(estimator=lr, n_features_to_select=n_features_to_select, step=0.1)
-        rfe.fit(X.fillna(0), y)
-        ranking = list(zip(X.columns, rfe.ranking_))
-        # ranking 1 means selected
-        selected = [(name, 1.0) for name, rank in ranking if rank == 1]
-        # for ordering present features by importance if estimator has coef_
-        if hasattr(rfe.estimator_, 'coef_'):
-            coefs = np.abs(rfe.estimator_.coef_).mean(axis=0)
-            scores = sorted(zip(X.columns, coefs), key=lambda x: -x[1])
-            results['rfe_logistic'] = scores[:top_k]
-        else:
-            results['rfe_logistic'] = selected[:top_k]
-    except Exception as e:
-        print("RFE failed:", e)
-        results['rfe_logistic'] = []
-
-    return results
-
-
-def aggregate_feature_rankings(method_results: Dict[str, Dict]) -> pd.DataFrame:
-    """
-    Aggregate rankings from multiple methods into a single DataFrame with votes and average rank.
-    method_results: mapping method_name -> list of (feature, score)
-    """
-    votes = defaultdict(lambda: [])
-    for method, items in method_results.items():
-        for rank, (feat, score) in enumerate(items, start=1):
-            votes[feat].append(rank)
-
-    agg = []
-    for feat, ranks in votes.items():
-        agg.append({
-            'feature': feat,
-            'votes': len(ranks),
-            'avg_rank': np.mean(ranks)
-        })
-    df_agg = pd.DataFrame(agg).sort_values(['votes', 'avg_rank'], ascending=[False, True])
-    return df_agg
-
-
-def evaluate_models(X: pd.DataFrame, y: pd.Series, feature_subset: Optional[List[str]] = None, cv_splits: int = 5) -> Dict[str, float]:
-    """
-    Train and evaluate LogisticRegression and RandomForest using StratifiedKFold CV, report macro/micro F1.
-    Returns summary dict.
-    """
-    results = {}
-    X_use = X[feature_subset] if feature_subset is not None else X
-    skf = StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=RANDOM_STATE)
-
-    models = {
-        'LogisticRegression': LogisticRegression(max_iter=5000, solver='saga', class_weight='balanced', random_state=RANDOM_STATE),
-        'RandomForest': RandomForestClassifier(n_estimators=300, random_state=RANDOM_STATE, n_jobs=N_JOBS, class_weight='balanced')
-    }
-
-    for name, model in models.items():
-        f1_macro = cross_val_score(model, X_use.fillna(0), y, scoring='f1_macro', cv=skf, n_jobs=N_JOBS).mean()
-        f1_micro = cross_val_score(model, X_use.fillna(0), y, scoring='f1_micro', cv=skf, n_jobs=N_JOBS).mean()
-        results[name] = {'f1_macro': float(f1_macro), 'f1_micro': float(f1_micro)}
-        print(f"{name}: f1_macro={f1_macro:.4f}, f1_micro={f1_micro:.4f}")
-    return results
-
-
-def resample_data(X: pd.DataFrame, y: pd.Series, method: str = 'none', categorical_features: Optional[List[str]] = None) -> Tuple[pd.DataFrame, pd.Series]:
-    """
-    Resample X,y using method:
-      - 'none' : no resampling
-      - 'oversample' : RandomOverSampler
-      - 'undersample' : RandomUnderSampler
-      - 'smote' : SMOTE (numeric only)
-      - 'smotenc' : SMOTENC (for datasets with categorical_features indices)
-    categorical_features: list of column names which are categorical (required for smotenc)
-    """
-    method = method.lower()
-    if method == 'none':
-        return X, y
-
-    # Ensure imblearn is available for resampling methods
-    if not IMBLEARN_AVAILABLE:
-        raise ImportError(
-            f"Requested resampling method '{method}' but imbalanced-learn (imblearn) is not installed. "
-            "Install it with: pip install imbalanced-learn or add it to your deployment requirements."
-        )
-
-    if method == 'oversample':
-        ros = RandomOverSampler(random_state=RANDOM_STATE)
-        X_res, y_res = ros.fit_resample(X, y)
-        return pd.DataFrame(X_res, columns=X.columns), pd.Series(y_res, name=y.name)
-
-    if method == 'undersample':
-        rus = RandomUnderSampler(random_state=RANDOM_STATE)
-        X_res, y_res = rus.fit_resample(X, y)
-        return pd.DataFrame(X_res, columns=X.columns), pd.Series(y_res, name=y.name)
-
-    if method == 'smote':
-        sm = SMOTE(random_state=RANDOM_STATE)
-        X_res, y_res = sm.fit_resample(X.select_dtypes(include=[np.number]), y)
-        # combine numeric resampled with categorical repeated rows if any
-        # If dataset has categorical columns we need SMOTENC; here we'll just return numeric-only resampled
-        return pd.DataFrame(X_res, columns=X.select_dtypes(include=[np.number]).columns), pd.Series(y_res, name=y.name)
-
-    if method == 'smotenc':
-        if not categorical_features:
-            raise ValueError("categorical_features must be provided for smotenc")
-        cat_idx = [list(X.columns).index(c) for c in categorical_features]
-        smnc = SMOTENC(categorical_features=cat_idx, random_state=RANDOM_STATE)
-        X_res, y_res = smnc.fit_resample(X.fillna(0), y)
-        return pd.DataFrame(X_res, columns=X.columns), pd.Series(y_res, name=y.name)
-
-    raise ValueError("Unknown resampling method: " + method)
-
-
-def tune_model_with_resampling(X: pd.DataFrame, y: pd.Series, sampler: Optional[str] = None, categorical_features: Optional[List[str]] = None) -> Tuple[GridSearchCV, Dict]:
-    """
-    Create a pipeline (optional sampler -> scaler -> classifier) and run GridSearchCV for RandomForest and LogisticRegression.
-    sampler: 'none', 'oversample', 'smote', 'smotenc'
-    Returns fitted gridsearch (for last estimator) and best_params summary.
-    """
-    if sampler and sampler != 'none' and not IMBLEARN_AVAILABLE:
-        raise ImportError(
-            f"Requested sampler '{sampler}' in tuning pipeline but imbalanced-learn is not installed. "
-            "Install it with: pip install imbalanced-learn or add it to your deployment requirements."
-        )
-
-    # Build sampler object if requested
-    sampler_obj = None
-    if sampler and sampler != 'none':
-        s = sampler.lower()
-        if s == 'oversample':
-            sampler_obj = RandomOverSampler(random_state=RANDOM_STATE)
-        elif s == 'smote':
-            sampler_obj = SMOTE(random_state=RANDOM_STATE)
-        elif s == 'smotenc':
-            if not categorical_features:
-                raise ValueError("Pass categorical_features for smotenc")
-            cat_idx = [list(X.columns).index(c) for c in categorical_features]
-            sampler_obj = SMOTENC(categorical_features=cat_idx, random_state=RANDOM_STATE)
-        else:
-            raise ValueError("Unknown sampler requested: " + sampler)
-
-    # Use imblearn Pipeline if available and sampler is present, otherwise sklearn Pipeline
-    if sampler_obj is not None:
-        if not IMBLEARN_AVAILABLE:
-            raise ImportError("imblearn pipeline required but imbalanced-learn is not installed.")
-        pipe_steps = [('sampler', sampler_obj), ('scaler', StandardScaler()), ('clf', RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=N_JOBS))]
-        pipeline = ImbPipeline(pipe_steps)
+    if best_pipe is None:
+        st.warning("Train + evaluate models first so the app can pick a best model.")
     else:
-        pipeline = Pipeline([('scaler', StandardScaler()), ('clf', RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=N_JOBS))])
+        st.write(f"Using best model: **{best_model_name}**")
 
-    param_grid = {
-        'clf__n_estimators': [100, 300],
-        'clf__max_depth': [None, 10, 30],
-        'clf__class_weight': [None, 'balanced']
-    }
+        if st.button("Compute permutation importance"):
+            scoring = "f1_macro" if task == "classification" else "r2"
+            perm = permutation_importance(
+                best_pipe, X_test, y_test,
+                n_repeats=10,
+                random_state=random_state,
+                scoring=scoring
+            )
+            importances = pd.DataFrame({
+                "feature": feature_cols,
+                "importance_mean": perm.importances_mean,
+                "importance_std": perm.importances_std
+            }).sort_values("importance_mean", ascending=False)
 
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
-    gs = GridSearchCV(pipeline, param_grid, scoring='f1_macro', cv=skf, n_jobs=N_JOBS, verbose=1)
-    gs.fit(X.fillna(0), y)
-    print("Best params:", gs.best_params_)
-    print("Best score (f1_macro):", gs.best_score_)
-    return gs, {'best_params': gs.best_params_, 'best_score': float(gs.best_score_)}
+            st.dataframe(importances.head(20), use_container_width=True)
 
+            fig, ax = plt.subplots()
+            top = importances.head(15)
+            ax.bar(top["feature"].astype(str), top["importance_mean"].values)
+            ax.set_title("Top Feature Importances (Permutation)")
+            ax.set_ylabel("Importance (mean)")
+            plt.xticks(rotation=45, ha="right")
+            st.pyplot(fig)
 
-def demo_flow(path: Optional[str] = None, df: Optional[pd.DataFrame] = None):
-    # Load
-    data = load_data(path, df)
-    X, y = split_features_target(data)
-    show_class_distribution(y)
+            st.session_state["feature_importance"] = importances
 
-    num_cols, cat_cols = identify_column_types(X)
+elif page.startswith("7)"):
+    st.subheader("7) Final Model + Prediction Demo")
+    best_pipe = st.session_state.get("best_pipe", None)
+    best_model_name = st.session_state.get("best_model_name", None)
 
-    print("\nRunning filter methods...")
-    filter_results = run_filter_methods(X, y, num_cols, cat_cols, top_k=TOP_K)
-    for k, v in filter_results.items():
-        print(f"\nTop results for {k}:")
-        for feat, score in v[:10]:
-            print(f"  {feat}: {score:.6f}")
+    if best_pipe is None:
+        st.warning("Train + evaluate models first so the app can choose a best model.")
+    else:
+        st.write(f"Best model currently selected: **{best_model_name}**")
+        st.markdown("Fill the inputs below to get a prediction.")
 
-    print("\nRunning embedded methods...")
-    embedded_results = run_embedded_methods(X, y, top_k=TOP_K)
-    for k, v in embedded_results.items():
-        print(f"\nTop results for {k}:")
-        for feat, score in v[:10]:
-            print(f"  {feat}: {score:.6f}")
+        with st.form("predict_form"):
+            user_row = {}
+            for col in feature_cols:
+                if col in num_cols:
+                    default_val = float(np.nan_to_num(X[col].median(), nan=0.0))
+                    user_row[col] = st.number_input(col, value=default_val)
+                else:
+                    options = sorted(X[col].dropna().astype(str).unique().tolist())
+                    user_row[col] = st.selectbox(col, options=options if options else [""])
 
-    print("\nRunning wrapper methods (RFE)...")
-    wrapper_results = run_wrapper_methods(X, y, top_k=TOP_K)
-    for k, v in wrapper_results.items():
-        print(f"\nTop results for {k}:")
-        for feat, score in v[:10]:
-            print(f"  {feat}: {score:.6f}")
+            submit = st.form_submit_button("Predict")
 
-    # Aggregate feature rankings
-    method_results_combined = {**filter_results, **embedded_results, **wrapper_results}
-    agg = aggregate_feature_rankings(method_results_combined)
-    print("\nAggregated feature ranking (top 30):")
-    print(agg.head(30))
+        if submit:
+            inp = pd.DataFrame([user_row])
+            pred = best_pipe.predict(inp)[0]
+            st.success(f"Prediction: **{pred}**")
 
-    # Use top N aggregated features to evaluate models
-    top_features = agg['feature'].head(30).tolist()
-    print("\nEvaluating models using top aggregated features:")
-    eval_results_top = evaluate_models(X, y, feature_subset=top_features, cv_splits=5)
+elif page.startswith("8)"):
+    st.subheader("8) Summary of Findings")
+    best_model_name = st.session_state.get("best_model_name", None)
+    feat_imp = st.session_state.get("feature_importance", None)
 
-    print("\nEvaluate baseline models on all features:")
-    eval_results_all = evaluate_models(X, y, feature_subset=None, cv_splits=5)
+    st.markdown("""
+**This app demonstrates the full process:**
+- Upload / load dataset
+- Explore distributions (including Polymer Type)
+- Preprocess and prepare features
+- Optional SMOTE for class imbalance (training only)
+- Train multiple models
+- Evaluate and compare performance
+- Analyze feature relevance
+- Predict risk from user inputs
+""")
 
-    # Investigate class imbalance and resampling
-    print("\nComparing resampling strategies (none, oversample, undersample, smote, smotenc if available):")
-    resample_methods = ['none', 'oversample', 'undersample']
-    if IMBLEARN_AVAILABLE and len(num_cols) > 0:
-        resample_methods.append('smote')
-    if IMBLEARN_AVAILABLE and len(cat_cols) > 0:
-        resample_methods.append('smotenc')
-    if not IMBLEARN_AVAILABLE:
-        print("Note: imbalanced-learn not available; skipping SMOTE/SMOTENC/imbalanced pipelines. Install imbalanced-learn to enable them.")
+    if best_model_name:
+        st.markdown(f"### Current best model: **{best_model_name}**")
+    else:
+        st.info("No best model selected yet. Train and evaluate first.")
 
-    resample_summary = {}
-    for method in resample_methods:
-        print(f"\nResampling method: {method}")
-        try:
-            X_res, y_res = resample_data(X, y, method=method, categorical_features=cat_cols if method == 'smotenc' else None)
-            print(f"After resampling distribution: {Counter(y_res)}")
-            # Evaluate on resampled data using top_features intersection (ensure features exist)
-            features_to_use = [f for f in top_features if f in X_res.columns]
-            print("Features used:", len(features_to_use))
-            res_eval = evaluate_models(X_res, y_res, feature_subset=features_to_use if features_to_use else None, cv_splits=5)
-            resample_summary[method] = res_eval
-        except Exception as e:
-            print("Resampling failed for method", method, "error:", e)
-
-    # Example hyperparameter tuning with resampling in pipeline (only if imblearn available or sampler is 'none')
-    print("\nRunning GridSearchCV with Optional Resampling + RandomForest (this may take a while)...")
-    try:
-        if IMBLEARN_AVAILABLE:
-            gs, gs_summary = tune_model_with_resampling(X[top_features], y, sampler='oversample', categorical_features=cat_cols)
-        else:
-            print("imblearn not available: running GridSearchCV without resampling sampler")
-            gs, gs_summary = tune_model_with_resampling(X[top_features], y, sampler='none', categorical_features=cat_cols)
-    except Exception as e:
-        print("GridSearchCV failed:", e)
-        gs_summary = {}
-
-    print("\nDone. Summaries:")
-    print("Evaluation with top features:", eval_results_top)
-    print("Evaluation with all features:", eval_results_all)
-    print("Resampling summary:", resample_summary)
-    print("GridSearch summary:", gs_summary)
-
-    # Optionally save top features to CSV
-    agg.to_csv("feature_ranking_aggregated.csv", index=False)
-    print("\nAggregated feature ranking saved to feature_ranking_aggregated.csv")
-
-    # Return important objects if programmatic access desired
-    return {
-        'agg': agg,
-        'filter_results': filter_results,
-        'embedded_results': embedded_results,
-        'wrapper_results': wrapper_results,
-        'eval_top': eval_results_top,
-        'eval_all': eval_results_all,
-        'resample_summary': resample_summary,
-        'gridsearch_summary': gs_summary
-    }
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Feature selection, class imbalance investigation, resampling, and basic tuning for Risk_Type")
-    parser.add_argument("--path", type=str, default=DATA_PATH, help="Path to preprocessed CSV file (must contain 'Risk_Type')")
-    args = parser.parse_args()
-    demo_flow(path=args.path)
+    if feat_imp is not None:
+        st.markdown("### Top drivers (from permutation importance)")
+        st.dataframe(feat_imp.head(10), use_container_width=True)
+    else:
+        st.info("Feature relevance not computed yet. Go to Feature Relevance and run it.")
