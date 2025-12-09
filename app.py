@@ -297,8 +297,8 @@ if not feature_cols:
     st.error("Please select at least one feature column.")
     st.stop()
 
-# Reset models when config changes (simple heuristic)
-cfg_signature = (tuple(feature_cols), target_col, test_size, int(random_state), bool(use_smote), task)
+# Reset models when config changes
+cfg_signature = (tuple(feature_cols), target_col, float(test_size), int(random_state), bool(use_smote), task)
 if st.session_state.get("cfg_signature") != cfg_signature:
     st.session_state["cfg_signature"] = cfg_signature
     reset_model_state()
@@ -338,14 +338,14 @@ STEPS = [
 ]
 TOTAL = len(STEPS)
 
-# Left sidebar step list (true “window switching”)
+# Left sidebar step list
 with st.sidebar:
     st.markdown("## Process Windows")
     step_labels = [f"{i+1}. {name}" for i, (name, _) in enumerate(STEPS)]
     selected = st.radio("Select window", step_labels, index=st.session_state["step"])
     goto(step_labels.index(selected))
     st.markdown("---")
-    st.caption("Tip: during defense, just click Next/Back or select a window here.")
+    st.caption("During defense: click Next/Back or choose a window here.")
 
 # Window header
 step = st.session_state["step"]
@@ -353,7 +353,6 @@ step_title, step_desc = STEPS[step]
 st.markdown(f"## {step+1}) {step_title}")
 st.caption(step_desc)
 step_nav(TOTAL)
-
 st.write("")
 
 
