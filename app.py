@@ -201,7 +201,7 @@ def safe_train_test_split(X, y, test_size=0.2, random_state=42):
 
 
 # -------------------------------------------------------
-# SAFE CV PICKER (prevents crash in Model Validation)
+# SAFE CV PICKER
 # -------------------------------------------------------
 def pick_safe_cv(y: pd.Series, requested_splits: int, stratified: bool):
     y = pd.Series(y).dropna()
@@ -237,7 +237,7 @@ def pick_safe_cv(y: pd.Series, requested_splits: int, stratified: bool):
 
 
 # -------------------------------------------------------
-# LEAKAGE-SAFE PIPELINE BUILDERS (for both holdout + CV)
+# PIPELINES
 # -------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def build_preprocess_pipeline_cached(df_raw: pd.DataFrame, drop_cols_for_model: tuple):
@@ -485,7 +485,6 @@ def run_cv(
     model_name: str,
     n_splits: int,
     stratified: bool,
-    use_smote: bool,
     drop_cols_for_model: tuple,
     fast_mode: bool,
 ):
@@ -506,9 +505,7 @@ def run_cv(
     cv, cv_note = pick_safe_cv(y, n_splits, stratified)
     preprocessor = build_preprocess_pipeline_cached(df_raw, drop_cols_for_model)
 
-    if use_smote and not IMBLEARN_OK:
-        use_smote = False
-        cv_note += " ⚠️ SMOTE disabled (imbalanced-learn not installed)."
+    # NOTE: For CV we removed SMOTE to keep it very lightweight and robust
 
     fold_scores = {
         "accuracy": [],
@@ -526,17 +523,10 @@ def run_cv(
                 fold_scores[k].append(np.nan)
             continue
 
-        if use_smote:
-            pipe = ImbPipeline(steps=[
-                ("prep", preprocessor),
-                ("smote", SMOTE(random_state=42)),
-                ("model", model),
-            ])
-        else:
-            pipe = Pipeline(steps=[
-                ("prep", preprocessor),
-                ("model", model),
-            ])
+        pipe = Pipeline(steps=[
+            ("prep", preprocessor),
+            ("model", model),
+        ])
 
         try:
             pipe.fit(X_train, y_train)
@@ -700,7 +690,7 @@ def main():
 
         ✅ Modeling + CV are leakage-safe (Pipeline does preprocessing inside train/CV folds).  
         ✅ Numeric coercion prevents SimpleImputer fit errors.  
-        ✅ Model Validation is crash-safe (manual CV loop, skips bad folds).
+        ✅ Model Validation is simplified & lightweight (Logistic Regression, optional row sampling).
         """
     )
 
@@ -720,12 +710,10 @@ def main():
         ],
         "🧠 Modeling": [
             "Classification Modeling (Tasks 4, 5 & 7)",
+            "Cross Validation (K-Fold)",
         ],
         "⚙️ Optimization": [
             "SMOTE & Hyperparameter Tuning (Risk_Type)",
-        ],
-        "✅ Model Validation": [
-            "Cross Validation (K-Fold)",
         ],
     }
 
@@ -960,6 +948,78 @@ def main():
         )
 
     # -------------------- PAGE 5 --------------------
+    elif page == "Cross Validation (K-Fold)":
+        st.header("Cross Validation (K-Fold) for Classification Model")
+
+        st.markdown(
+            """
+            This section validates a **classification model** using K-Fold Cross Validation.
+
+            - Target variable: **Risk_Type**  
+            - Model: **Logistic Regression** (lightweight, stable, good baseline)  
+            - Preprocessing (imputation, scaling, encoding) is included inside the pipeline → leakage-safe.
+            """
+        )
+
+        target = TARGET_RISK_TYPE
+        model_name = "Logistic Regression"
+        st.info(f"Target fixed to **{target}** and model fixed to **{model_name}** for validation.")
+
+        # Light CV: k between 3 and 5 only
+        n_splits = st.slider("Number of folds (k)", min_value=3, max_value=5, value=3, step=1)
+        stratified = st.checkbox("Use Stratified K-Fold (recommended for classification)", value=True)
+
+        # Optional sampling for safety
+        max_rows = 500
+        if len(df_raw) > max_rows:
+            st.warning(
+                f"Dataset has {len(df_raw)} rows. For stable CV in limited resources, "
+                f"we sample {max_rows} rows for cross-validation."
+            )
+            df_cv = df_raw.sample(max_rows, random_state=42).reset_index(drop=True)
+        else:
+            df_cv = df_raw.copy()
+
+        st.divider()
+
+        colA, colB = st.columns([1, 2])
+        with colA:
+            st.subheader("Risk_Type distribution (after rare-class merge)")
+            if target in df_cv.columns:
+                y_preview = merge_rare_classes(df_cv[target].dropna(), min_count=2, other_label="Other")
+                st.write(y_preview.value_counts())
+            else:
+                st.warning(f"Column '{target}' not found in the dataset.")
+
+        with colB:
+            if st.button("Run Cross-Validation", type="primary"):
+                with st.spinner("Running K-Fold CV on Logistic Regression (Risk_Type)..."):
+                    try:
+                        summary_df, _, cv_note = run_cv(
+                            df_raw=df_cv,
+                            target_col=target,
+                            model_name=model_name,
+                            n_splits=n_splits,
+                            stratified=stratified,
+                            drop_cols_for_model=drop_cols_for_model,
+                            fast_mode=fast_mode,
+                        )
+                        st.info(cv_note)
+                        st.subheader("CV Summary (mean ± std)")
+                        st.dataframe(summary_df.round(4))
+
+                        st.markdown(
+                            """
+                            **Interpretation hint (for defense):**  
+                            - *Accuracy* shows overall correct predictions across folds.  
+                            - *Precision (weighted)* and *Recall (weighted)* account for class imbalance.  
+                            - *F1-score (weighted)* balances precision and recall and is a good summary metric.  
+                            """
+                        )
+                    except Exception as e:
+                        st.error(f"CV failed: {e}")
+
+    # -------------------- PAGE 6 --------------------
     elif page == "Polymer Type Distribution":
         st.header("Polymer Type Distribution")
         df = handle_missing_values(df_raw)
@@ -989,7 +1049,7 @@ def main():
         else:
             st.warning("Column 'Polymer_Type' not found in the dataset.")
 
-    # -------------------- PAGE 6 --------------------
+    # -------------------- PAGE 7 --------------------
     elif page == "SMOTE & Hyperparameter Tuning (Risk_Type)":
         st.header("Address Class Imbalance & Tune Logistic Regression (Risk-Type)")
 
@@ -1036,73 +1096,6 @@ def main():
             st.subheader("Comparison: Tuned Logistic Regression vs Base Models")
             st.dataframe(combined.round(3))
             st.pyplot(plot_metrics_bar(combined, "(Risk-Type – Base vs Tuned)"))
-
-    # -------------------- PAGE 7 --------------------
-    elif page == "Cross Validation (K-Fold)":
-        st.header("Cross Validation (K-Fold / Stratified K-Fold)")
-
-        st.markdown(
-            """
-            This section validates the **best classification model** using K-Fold Cross Validation.
-
-            - Target variable: **Risk_Type**  
-            - Model: **Random Forest Classifier**  
-            - Preprocessing (imputation, scaling, encoding) is included inside the pipeline, so validation is leakage-safe.
-            """
-        )
-
-        # 🔒 Fix target and model for validation (as per your research design)
-        target = TARGET_RISK_TYPE
-        model_name = "Random Forest"
-
-        st.info(f"Target fixed to **{target}** and model fixed to **{model_name}** for validation.")
-
-        n_splits = st.slider("Number of folds (k)", min_value=3, max_value=10, value=5, step=1)
-        stratified = st.checkbox("Use Stratified K-Fold (recommended for classification)", value=True)
-
-        use_smote = st.checkbox("Use SMOTE (only if classes are imbalanced)", value=False)
-        if use_smote:
-            st.caption("SMOTE will be applied inside each fold (if available).")
-
-        st.divider()
-
-        colA, colB = st.columns([1, 2])
-        with colA:
-            st.subheader("Risk_Type distribution (after rare-class merge)")
-            if target in df_raw.columns:
-                y_preview = merge_rare_classes(df_raw[target].dropna(), min_count=2, other_label="Other")
-                st.write(y_preview.value_counts())
-            else:
-                st.warning(f"Column '{target}' not found in the dataset.")
-
-        with colB:
-            if st.button("Run Cross-Validation", type="primary"):
-                with st.spinner("Running CV on Random Forest (Risk_Type)..."):
-                    try:
-                        summary_df, _, cv_note = run_cv(
-                            df_raw=df_raw,
-                            target_col=target,
-                            model_name=model_name,
-                            n_splits=n_splits,
-                            stratified=stratified,
-                            use_smote=use_smote,
-                            drop_cols_for_model=drop_cols_for_model,
-                            fast_mode=fast_mode,
-                        )
-                        st.info(cv_note)
-                        st.subheader("CV Summary (mean ± std)")
-                        st.dataframe(summary_df.round(4))
-
-                        st.markdown(
-                            """
-                            **Interpretation hint (for defense):**  
-                            - *Accuracy* shows overall correct predictions across folds.  
-                            - *Precision (weighted)* and *Recall (weighted)* account for class imbalance.  
-                            - *F1-score (weighted)* balances precision and recall and is a good summary metric.  
-                            """
-                        )
-                    except Exception as e:
-                        st.error(f"CV failed: {e}")
 
 
 if __name__ == "__main__":
