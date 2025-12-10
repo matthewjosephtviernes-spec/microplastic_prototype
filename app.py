@@ -1,769 +1,664 @@
-# app.py — Clean, Defense-ready Streamlit UI (Windows per Process)
-import re
+# app.py
+# Streamlit Dashboard: Predictive Risk Modeling Framework for Microplastic Pollution
+# - Objective 1: EDA + preprocessing (load/apply preprocessor)
+# - Objective 2: modeling + feature relevance (load trained artifacts)
+# - Objective 3: validation (display CV results; optional run-CV if enabled)
+
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Optional, Tuple, List
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.impute import SimpleImputer
-from sklearn.metrics import (
-    classification_report, confusion_matrix, ConfusionMatrixDisplay,
-    accuracy_score, f1_score, balanced_accuracy_score,
-    mean_absolute_error, mean_squared_error, r2_score
-)
-from sklearn.linear_model import LogisticRegression, Ridge
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, RandomForestRegressor
-from sklearn.inspection import permutation_importance
-
-try:
-    from imblearn.over_sampling import SMOTE
-    from imblearn.pipeline import Pipeline as ImbPipeline
-    IMBLEARN_OK = True
-except Exception:
-    IMBLEARN_OK = False
-
+# Optional plotting libs
 import matplotlib.pyplot as plt
 
-
-# -----------------------------
-# Styling (clean UI)
-# -----------------------------
-st.set_page_config(page_title="Microplastic Risk Modeling", layout="wide")
-
-HIDE_DEFAULTS = True  # set False if you want default menu/footer visible
-
-st.markdown(
-    """
-    <style>
-      .block-container { padding-top: 1.1rem; padding-bottom: 2.5rem; max-width: 1150px; }
-      h1, h2, h3 { letter-spacing: -0.2px; }
-      .hero {
-        border-radius: 18px;
-        padding: 18px 18px 14px 18px;
-        background: linear-gradient(135deg, rgba(0,122,255,0.10), rgba(0,0,0,0.02));
-        border: 1px solid rgba(0,122,255,0.18);
-      }
-      .hero-title { margin: 0; font-size: 1.55rem; }
-      .hero-sub { margin-top: 6px; color: rgba(0,0,0,0.65); font-size: 0.95rem; }
-      .card {
-        border-radius: 16px;
-        padding: 14px 14px 10px 14px;
-        background: rgba(0,0,0,0.02);
-        border: 1px solid rgba(0,0,0,0.06);
-      }
-      .muted { color: rgba(0,0,0,0.62); font-size: 0.92rem; }
-      div[data-testid="stMetric"] {
-        background: rgba(0,0,0,0.02);
-        padding: 12px;
-        border-radius: 14px;
-        border: 1px solid rgba(0,0,0,0.06);
-      }
-      .stTabs [data-baseweb="tab-list"] { gap: 8px; }
-      .stButton>button { border-radius: 12px; padding-top: 10px; padding-bottom: 10px; }
-      .stDownloadButton>button { border-radius: 12px; padding-top: 10px; padding-bottom: 10px; }
-      .small-note { font-size: 0.88rem; color: rgba(0,0,0,0.6); }
-    </style>
-    """,
-    unsafe_allow_html=True
+# Optional ML libs (only needed if you enable "Train/CV inside app")
+from sklearn.model_selection import StratifiedKFold, cross_validate, train_test_split
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+    confusion_matrix,
+    ConfusionMatrixDisplay,
 )
 
-if HIDE_DEFAULTS:
-    st.markdown(
-        """
-        <style>
-          #MainMenu {visibility: hidden;}
-          footer {visibility: hidden;}
-          header {visibility: hidden;}
-        </style>
-        """,
-        unsafe_allow_html=True
-    )
+try:
+    import joblib  # recommended for sklearn artifacts
+except Exception:
+    joblib = None
 
 
-# -----------------------------
+# ----------------------------
+# Config (EDIT THESE)
+# ----------------------------
+@dataclass(frozen=True)
+class AppConfig:
+    # Column names in your dataset (EDIT to match your CSV headers)
+    target_risk_level: str = "risk_level"      # classification target (Objective #1)
+    target_risk_type: str = "Risk_Type"        # classification target (Objective #2)
+    risk_score_col: str = "risk_score"         # numeric
+    mp_count_col: str = "mp count per l"       # numeric
+    polymer_type_col: str = "Polymer Type"     # categorical (optional)
+
+    # Artifact paths (produced by your offline training pipeline)
+    artifacts_dir: str = "artifacts"
+    preprocessor_path: str = "preprocessor.pkl"
+    model_path: str = "model.pkl"
+    risk_type_model_path: str = "risk_type_model.pkl"
+    selected_features_path: str = "selected_features.json"
+    feature_relevance_path: str = "feature_relevance.csv"
+    cv_results_path: str = "cv_results.csv"
+    risk_type_cv_results_path: str = "risk_type_cv_results.csv"
+
+
+CFG = AppConfig()
+
+
+# ----------------------------
+# Streamlit Page Setup
+# ----------------------------
+st.set_page_config(
+    page_title="Microplastic Risk Modeling Dashboard",
+    page_icon="🧪",
+    layout="wide",
+)
+
+st.title("🧪 Predictive Risk Modeling Framework for Microplastic Pollution")
+st.caption(
+    "EDA • Preprocessing • Feature Selection • Modeling • Cross-Validation • Prediction"
+)
+
+
+# ----------------------------
 # Helpers
-# -----------------------------
-def parse_numeric_with_units(x):
-    if pd.isna(x):
-        return np.nan
-    if isinstance(x, (int, float, np.integer, np.floating)):
-        return float(x)
-    s = str(x).strip()
-    m = re.search(r"[-+]?\d*\.?\d+", s)
-    return float(m.group(0)) if m else np.nan
+# ----------------------------
+def _safe_read_csv(uploaded_file) -> pd.DataFrame:
+    # Try utf-8, fallback latin1
+    try:
+        return pd.read_csv(uploaded_file)
+    except UnicodeDecodeError:
+        return pd.read_csv(uploaded_file, encoding="latin1")
 
 
-def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
+def _artifact(p: str) -> Path:
+    return Path(CFG.artifacts_dir) / p
+
+
+@st.cache_data(show_spinner=False)
+def load_dataset_from_upload(uploaded_file) -> pd.DataFrame:
+    df = _safe_read_csv(uploaded_file)
+    # Normalize column names lightly (keep original too)
     df.columns = [c.strip() for c in df.columns]
-
-    for col in ["Salinity", "MP_Count_per_L", "Microplastic_Size_mm", "Density", "pH"]:
-        if col in df.columns:
-            df[col] = df[col].apply(parse_numeric_with_units)
-
-    for col in ["Latitude", "Longitude"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    if "Risk_Level" in df.columns:
-        def map_level(x):
-            xl = str(x).strip().lower()
-            if "extreme" in xl or "level v" in xl:
-                return "Extreme"
-            if "high" in xl:
-                return "High"
-            if "medium" in xl or "moderate" in xl:
-                return "Medium"
-            if "low" in xl:
-                return "Low"
-            return "Other"
-        df["Risk_Level_std"] = df["Risk_Level"].apply(map_level)
-
     return df
 
 
-def build_preprocessor(X: pd.DataFrame):
-    numeric_cols = X.select_dtypes(include=["number"]).columns.tolist()
-    categorical_cols = [c for c in X.columns if c not in numeric_cols]
-
-    num_pipe = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler", StandardScaler()),
-    ])
-    cat_pipe = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("onehot", OneHotEncoder(handle_unknown="ignore")),
-    ])
-
-    pre = ColumnTransformer(
-        transformers=[
-            ("num", num_pipe, numeric_cols),
-            ("cat", cat_pipe, categorical_cols),
-        ],
-        remainder="drop"
-    )
-    return pre, numeric_cols, categorical_cols
+@st.cache_resource(show_spinner=False)
+def load_joblib_artifact(path: Path):
+    if not path.exists():
+        return None
+    if joblib is None:
+        st.warning("joblib is not available. Install: pip install joblib")
+        return None
+    try:
+        return joblib.load(path)
+    except Exception as e:
+        st.error(f"Failed to load artifact: {path}\n\n{e}")
+        return None
 
 
-def plot_bar_counts(series, title, max_bars=20):
-    counts = series.value_counts(dropna=False).head(max_bars)
+@st.cache_data(show_spinner=False)
+def load_json(path: Path) -> Optional[dict]:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner=False)
+def load_csv_artifact(path: Path) -> Optional[pd.DataFrame]:
+    if not path.exists():
+        return None
+    try:
+        return pd.read_csv(path)
+    except Exception:
+        return None
+
+
+def make_hist(series: pd.Series, title: str, bins: int = 30):
     fig, ax = plt.subplots()
-    ax.bar(counts.index.astype(str), counts.values)
+    s = series.dropna()
+    ax.hist(s, bins=bins)
     ax.set_title(title)
-    ax.set_xlabel(series.name)
+    ax.set_xlabel(series.name or "")
     ax.set_ylabel("Count")
-    plt.xticks(rotation=45, ha="right")
-    st.pyplot(fig)
+    st.pyplot(fig, clear_figure=True)
 
 
-def plot_conf_mat(y_true, y_pred, labels=None, title="Confusion Matrix"):
+def make_box_by_group(df: pd.DataFrame, value_col: str, group_col: str, title: str):
+    dd = df[[value_col, group_col]].dropna()
+    if dd.empty:
+        st.info("No data available for this plot (after dropping NA).")
+        return
+
+    groups = []
+    labels = []
+    for g, sub in dd.groupby(group_col):
+        groups.append(sub[value_col].values)
+        labels.append(str(g))
+
     fig, ax = plt.subplots()
-    cm = confusion_matrix(y_true, y_pred, labels=labels)
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=labels)
-    disp.plot(ax=ax, xticks_rotation=45, colorbar=False)
+    ax.boxplot(groups, labels=labels, vert=True)
     ax.set_title(title)
-    st.pyplot(fig)
+    ax.set_xlabel(group_col)
+    ax.set_ylabel(value_col)
+    plt.xticks(rotation=30, ha="right")
+    st.pyplot(fig, clear_figure=True)
 
 
-def metric_table_classification(y_true, y_pred):
-    return {
-        "Accuracy": accuracy_score(y_true, y_pred),
-        "Balanced Acc.": balanced_accuracy_score(y_true, y_pred),
-        "F1 (Macro)": f1_score(y_true, y_pred, average="macro"),
-        "F1 (Weighted)": f1_score(y_true, y_pred, average="weighted"),
+def make_scatter(df: pd.DataFrame, x: str, y: str, title: str):
+    dd = df[[x, y]].dropna()
+    if dd.empty:
+        st.info("No data available for this plot (after dropping NA).")
+        return
+    fig, ax = plt.subplots()
+    ax.scatter(dd[x], dd[y], s=10)
+    ax.set_title(title)
+    ax.set_xlabel(x)
+    ax.set_ylabel(y)
+    st.pyplot(fig, clear_figure=True)
+
+
+def metric_card_row(metrics: Dict[str, float]):
+    cols = st.columns(len(metrics))
+    for i, (k, v) in enumerate(metrics.items()):
+        cols[i].metric(k, f"{v:.4f}")
+
+
+def split_features_targets(
+    df: pd.DataFrame,
+    target_col: str,
+    drop_cols: Optional[List[str]] = None,
+) -> Tuple[pd.DataFrame, pd.Series]:
+    drop_cols = drop_cols or []
+    y = df[target_col]
+    X = df.drop(columns=[target_col] + drop_cols, errors="ignore")
+    return X, y
+
+
+def evaluate_classifier_basic(y_true, y_pred, y_proba=None) -> Dict[str, float]:
+    out = {
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "f1_weighted": float(f1_score(y_true, y_pred, average="weighted")),
+        "precision_weighted": float(precision_score(y_true, y_pred, average="weighted", zero_division=0)),
+        "recall_weighted": float(recall_score(y_true, y_pred, average="weighted", zero_division=0)),
     }
+    # For binary only ROC AUC
+    if y_proba is not None:
+        try:
+            if len(np.unique(y_true)) == 2:
+                out["roc_auc"] = float(roc_auc_score(y_true, y_proba))
+        except Exception:
+            pass
+    return out
 
 
-def metric_table_regression(y_true, y_pred):
-    return {
-        "MAE": mean_absolute_error(y_true, y_pred),
-        "RMSE": mean_squared_error(y_true, y_pred, squared=False),
-        "R2": r2_score(y_true, y_pred),
-    }
-
-
-@st.cache_data
-def load_data(uploaded):
-    def _read_csv(file_obj):
-        encodings = ["utf-8", "utf-8-sig", "cp1252", "latin1"]
-        last_err = None
-        for enc in encodings:
-            try:
-                if hasattr(file_obj, "seek"):
-                    file_obj.seek(0)
-                df_ = pd.read_csv(file_obj, encoding=enc, sep=None, engine="python")
-                return df_, enc
-            except Exception as e:
-                last_err = e
-        raise last_err
-
-    if uploaded is not None:
-        df0, enc = _read_csv(uploaded)
-        src = f"Uploaded CSV ({enc})"
-    else:
-        df0, enc = _read_csv("Microplastic.csv")
-        src = f"Microplastic.csv ({enc})"
-
-    df0 = clean_dataframe(df0)
-    return df0, src
-
-
-def reset_model_state():
-    st.session_state["trained_models"] = {}
-    st.session_state["best_model_name"] = None
-    st.session_state["best_pipe"] = None
-    st.session_state["feature_importance"] = None
-    st.session_state["cv_results"] = None
-
-
-def goto(step_idx: int):
-    st.session_state["step"] = int(step_idx)
-
-
-# -----------------------------
-# Session defaults
-# -----------------------------
-if "step" not in st.session_state:
-    st.session_state["step"] = 0
-if "trained_models" not in st.session_state:
-    reset_model_state()
-
-
-# -----------------------------
-# HERO
-# -----------------------------
-st.markdown(
-    """
-    <div class="hero">
-      <div class="hero-title"><b>Predictive Risk Modeling for Microplastic Pollution</b></div>
-      <div class="hero-sub">
-        A defense-ready dashboard showing the complete pipeline:
-        Upload → Explore → Preprocess → Imbalance → Train → Validate → Interpret → Predict
-      </div>
-    </div>
-    """,
-    unsafe_allow_html=True
-)
-st.write("")
-
-
-# -----------------------------
-# Sidebar: Steps
-# -----------------------------
-STEPS = [
-    ("📥 Upload", "Upload dataset + basic setup"),
-    ("🔎 Explore", "Distributions & preview"),
-    ("🧼 Preprocess", "Missing values & feature types"),
-    ("⚖️ Imbalance", "Class distribution + SMOTE"),
-    ("🧠 Train", "Train multiple models"),
-    ("✅ Validate", "Compare + best model + CV"),
-    ("🧩 Explain", "Feature importance"),
-    ("🔮 Predict", "Prediction demo"),
-    ("📌 Summary", "Defense summary"),
-]
+# ----------------------------
+# Sidebar: Data + Settings
+# ----------------------------
 with st.sidebar:
-    st.markdown("## Process Windows")
-    labels = [f"{i+1}. {name}" for i, (name, _) in enumerate(STEPS)]
-    picked = st.radio("Select a window", labels, index=st.session_state["step"])
-    goto(labels.index(picked))
-    st.markdown("---")
-    st.caption("Tip: During defense, navigate window-by-window for a clean story.")
+    st.header("📦 Data Input")
+    uploaded = st.file_uploader("Upload CSV dataset", type=["csv"])
+
+    st.divider()
+    st.header("🧩 Column Settings (edit if needed)")
+    target_risk_level = st.text_input("Target (Risk Level) column", CFG.target_risk_level)
+    target_risk_type = st.text_input("Target (Risk_Type) column", CFG.target_risk_type)
+    risk_score_col = st.text_input("Risk score column", CFG.risk_score_col)
+    mp_count_col = st.text_input("MP count column", CFG.mp_count_col)
+    polymer_type_col = st.text_input("Polymer type column", CFG.polymer_type_col)
+
+    st.divider()
+    st.header("⚙️ App Mode")
+    enable_train_inside_app = st.toggle(
+        "Enable train/CV inside app (slower)", value=False,
+        help="Recommended OFF. Prefer loading trained artifacts from /artifacts."
+    )
+
+    st.caption("Artifacts folder expected: ./artifacts/")
+    show_debug = st.toggle("Show debug info", value=False)
 
 
-# -----------------------------
-# Window 1: Upload + Config (clean)
-# -----------------------------
-step = st.session_state["step"]
+if uploaded is None:
+    st.info("Upload your CSV to begin.")
+    st.stop()
 
-if step == 0:
-    st.subheader("📥 Upload Dataset")
-    left, right = st.columns([1.15, 1.85])
+df = load_dataset_from_upload(uploaded)
+
+# ----------------------------
+# Artifact Loading
+# ----------------------------
+preprocessor = load_joblib_artifact(_artifact(CFG.preprocessor_path))
+model_obj1 = load_joblib_artifact(_artifact(CFG.model_path))
+model_obj2 = load_joblib_artifact(_artifact(CFG.risk_type_model_path))
+selected_features = load_json(_artifact(CFG.selected_features_path))
+feature_relevance_df = load_csv_artifact(_artifact(CFG.feature_relevance_path))
+cv_results_df = load_csv_artifact(_artifact(CFG.cv_results_path))
+risk_type_cv_results_df = load_csv_artifact(_artifact(CFG.risk_type_cv_results_path))
+
+if show_debug:
+    st.subheader("Debug: Dataset Preview")
+    st.write(df.head())
+    st.write("Columns:", list(df.columns))
+    st.write("Artifacts loaded:", {
+        "preprocessor": preprocessor is not None,
+        "model_obj1": model_obj1 is not None,
+        "model_obj2": model_obj2 is not None,
+        "selected_features": selected_features is not None,
+        "feature_relevance_df": feature_relevance_df is not None,
+        "cv_results_df": cv_results_df is not None,
+        "risk_type_cv_results_df": risk_type_cv_results_df is not None,
+    })
+
+
+# ----------------------------
+# Tabs
+# ----------------------------
+tabs = st.tabs([
+    "1) Overview",
+    "2) EDA (Objective 1)",
+    "3) Preprocessing (Objective 1)",
+    "4) Feature Selection & Relevance (Objective 2)",
+    "5) Modeling Results (Objective 2)",
+    "6) Validation / Cross-Validation (Objective 3)",
+    "7) Predict",
+])
+
+# ----------------------------
+# Tab 1: Overview
+# ----------------------------
+with tabs[0]:
+    st.subheader("Dataset Overview")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Rows", f"{df.shape[0]:,}")
+    c2.metric("Columns", f"{df.shape[1]:,}")
+    c3.metric("Missing cells", f"{int(df.isna().sum().sum()):,}")
+    c4.metric("Duplicate rows", f"{int(df.duplicated().sum()):,}")
+
+    with st.expander("Show column types"):
+        st.write(pd.DataFrame({
+            "column": df.columns,
+            "dtype": [str(t) for t in df.dtypes],
+            "missing": df.isna().sum().values
+        }))
+
+    st.markdown("### Targets availability")
+    tcols = st.columns(2)
+    if target_risk_level in df.columns:
+        tcols[0].success(f"Found target column (Risk Level): `{target_risk_level}`")
+        tcols[0].write(df[target_risk_level].value_counts(dropna=False).head(20))
+    else:
+        tcols[0].warning(f"Missing `{target_risk_level}`")
+
+    if target_risk_type in df.columns:
+        tcols[1].success(f"Found target column (Risk_Type): `{target_risk_type}`")
+        tcols[1].write(df[target_risk_type].value_counts(dropna=False).head(20))
+    else:
+        tcols[1].warning(f"Missing `{target_risk_type}`")
+
+# ----------------------------
+# Tab 2: EDA (Objective 1)
+# ----------------------------
+with tabs[1]:
+    st.subheader("EDA: Risk Score, Risk Level, MP Count, Polymer Type")
+
+    left, right = st.columns(2)
 
     with left:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        uploaded_file = st.file_uploader("Upload CSV file", type=["csv"])
-        try:
-            df, data_src = load_data(uploaded_file)
-            st.success(f"Loaded: {data_src}")
-        except Exception as e:
-            st.error(f"Could not load dataset.\n\nError: {e}")
-            st.stop()
-        st.markdown("</div>", unsafe_allow_html=True)
+        if risk_score_col in df.columns:
+            make_hist(df[risk_score_col], f"Distribution of {risk_score_col}")
+        else:
+            st.warning(f"Column not found: `{risk_score_col}`")
 
-        st.markdown('<div class="card" style="margin-top:12px;">', unsafe_allow_html=True)
-        st.markdown("**Dataset Quick Info**")
-        st.metric("Rows", int(df.shape[0]))
-        st.metric("Columns", int(df.shape[1]))
-        st.markdown("</div>", unsafe_allow_html=True)
+        if mp_count_col in df.columns and risk_score_col in df.columns:
+            make_scatter(df, mp_count_col, risk_score_col, f"{risk_score_col} vs {mp_count_col}")
+        else:
+            st.info("Scatter plot needs both risk score and mp count columns.")
 
     with right:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("**Configuration**")
+        if risk_score_col in df.columns and target_risk_level in df.columns:
+            make_box_by_group(df, risk_score_col, target_risk_level, f"{risk_score_col} by {target_risk_level}")
+        else:
+            st.info("Box plot needs risk score + risk level columns.")
 
-        target_choice = st.selectbox(
-            "Target variable",
-            options=[
-                "Risk_Type (Classification)",
-                "Risk_Score (Regression)",
-                "Risk_Level_std (Classification, cleaned)",
-            ],
-            index=0 if "Risk_Type" in df.columns else 1
+        if polymer_type_col in df.columns:
+            counts = df[polymer_type_col].value_counts(dropna=False).head(30)
+            fig, ax = plt.subplots()
+            ax.bar(counts.index.astype(str), counts.values)
+            ax.set_title(f"Top Polymer Types: {polymer_type_col}")
+            ax.set_xlabel(polymer_type_col)
+            ax.set_ylabel("Count")
+            plt.xticks(rotation=45, ha="right")
+            st.pyplot(fig, clear_figure=True)
+        else:
+            st.info("Polymer type column not found (optional).")
+
+    st.divider()
+    st.subheader("Outlier quick check (IQR) — Risk Score")
+    if risk_score_col in df.columns:
+        s = df[risk_score_col].dropna()
+        if len(s) > 10:
+            q1, q3 = np.percentile(s, [25, 75])
+            iqr = q3 - q1
+            low = q1 - 1.5 * iqr
+            high = q3 + 1.5 * iqr
+            outliers = ((df[risk_score_col] < low) | (df[risk_score_col] > high)).sum()
+            st.write(f"IQR bounds: [{low:.4f}, {high:.4f}]")
+            st.write(f"Flagged outliers: {int(outliers):,}")
+        else:
+            st.info("Not enough values to compute IQR.")
+    else:
+        st.warning(f"Column not found: `{risk_score_col}`")
+
+# ----------------------------
+# Tab 3: Preprocessing (Objective 1)
+# ----------------------------
+with tabs[2]:
+    st.subheader("Preprocessing")
+    st.markdown(
+        "Recommended: apply the same preprocessing used during training via a saved `preprocessor.pkl`."
+    )
+
+    if preprocessor is None:
+        st.warning(
+            "No `preprocessor.pkl` found in ./artifacts. "
+            "You can still explore EDA, but prediction and consistent transforms require the preprocessor."
         )
+    else:
+        st.success("Loaded preprocessor artifact ✅")
 
+    with st.expander("Preview: Preprocessed feature matrix (first 5 rows)"):
+        if preprocessor is None:
+            st.info("Upload a preprocessor artifact to see transformed features.")
+        else:
+            # Try to build X by dropping known targets if present
+            drop_cols = [c for c in [target_risk_level, target_risk_type] if c in df.columns]
+            X_raw = df.drop(columns=drop_cols, errors="ignore")
+            try:
+                Xp = preprocessor.transform(X_raw)
+                # If it's sparse, convert small preview only
+                if hasattr(Xp, "toarray"):
+                    Xp_preview = Xp[:5].toarray()
+                else:
+                    Xp_preview = np.asarray(Xp[:5])
+                st.write(pd.DataFrame(Xp_preview))
+            except Exception as e:
+                st.error(f"Preprocessing failed. Ensure your uploaded dataset matches training schema.\n\n{e}")
+
+# ----------------------------
+# Tab 4: Feature Selection & Relevance (Objective 2)
+# ----------------------------
+with tabs[3]:
+    st.subheader("Feature Selection & Feature Relevance")
+    if selected_features is not None:
+        st.success("Loaded selected features ✅")
+        st.write(selected_features)
+    else:
+        st.info("No selected_features.json found in ./artifacts (optional).")
+
+    if feature_relevance_df is not None and not feature_relevance_df.empty:
+        st.success("Loaded feature relevance ✅")
+        st.dataframe(feature_relevance_df.head(50), use_container_width=True)
+
+        # Expecting columns like: feature, importance
+        cols = [c.lower() for c in feature_relevance_df.columns]
+        if "feature" in cols and ("importance" in cols or "relevance" in cols):
+            fcol = feature_relevance_df.columns[cols.index("feature")]
+            icol = feature_relevance_df.columns[cols.index("importance")] if "importance" in cols else feature_relevance_df.columns[cols.index("relevance")]
+            topn = st.slider("Top N features to plot", 5, 30, 15)
+            top = feature_relevance_df.sort_values(icol, ascending=False).head(topn)
+
+            fig, ax = plt.subplots()
+            ax.barh(top[fcol].astype(str), top[icol].values)
+            ax.set_title("Top Feature Relevance")
+            ax.set_xlabel(icol)
+            ax.invert_yaxis()
+            st.pyplot(fig, clear_figure=True)
+        else:
+            st.caption("To auto-plot, provide columns named `feature` and `importance` (or `relevance`).")
+    else:
+        st.info("No feature_relevance.csv found in ./artifacts (optional).")
+
+# ----------------------------
+# Tab 5: Modeling Results (Objective 2)
+# ----------------------------
+with tabs[4]:
+    st.subheader("Modeling Results (Artifacts)")
+    st.markdown(
+        "This section assumes you already trained models offline and saved them in `./artifacts`."
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("#### Objective #1 Model (Risk Level)")
+        st.write("Loaded:", bool(model_obj1))
+        if model_obj1 is None:
+            st.info("Add `model.pkl` to ./artifacts to enable predictions/evaluation.")
+    with c2:
+        st.markdown("#### Objective #2 Model (Risk_Type)")
+        st.write("Loaded:", bool(model_obj2))
+        if model_obj2 is None:
+            st.info("Add `risk_type_model.pkl` to ./artifacts to enable predictions/evaluation.")
+
+    st.divider()
+
+    if enable_train_inside_app:
+        st.warning("Train inside app is ON. This is slower and mainly for demos.")
+        st.markdown("#### Quick train/evaluate (holdout split)")
+        target_choice = st.selectbox("Choose target to train", [target_risk_level, target_risk_type])
         test_size = st.slider("Test size", 0.1, 0.4, 0.2, 0.05)
         random_state = st.number_input("Random state", value=42, step=1)
 
-        if target_choice.startswith("Risk_Score"):
-            use_smote = False
-            st.caption("SMOTE not applicable for regression.")
+        if st.button("Train & Evaluate (Holdout)"):
+            if target_choice not in df.columns:
+                st.error(f"Target column not found: {target_choice}")
+            elif preprocessor is None:
+                st.error("Need preprocessor.pkl to train inside app consistently.")
+            else:
+                # Basic pipeline assumption: you trained a *full pipeline* offline.
+                # Here we only demonstrate evaluating a loaded model if it supports fit.
+                # For proper in-app training, you'd need a model pipeline builder.
+                st.error(
+                    "In-app training requires you to define model pipelines (preprocess + model). "
+                    "Recommended: train offline and load artifacts."
+                )
+    else:
+        st.info("Tip: keep training/tuning offline; display results here + predictions in the next tab.")
+
+# ----------------------------
+# Tab 6: Validation / Cross-Validation (Objective 3)
+# ----------------------------
+with tabs[5]:
+    st.subheader("Validation / Cross-Validation (Objective 3)")
+    st.markdown(
+        "Best practice: run CV on TRAIN data only during development, then save results as CSV for reporting."
+    )
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("#### CV Results — Objective #1 (Risk Level)")
+        if cv_results_df is not None and not cv_results_df.empty:
+            st.dataframe(cv_results_df, use_container_width=True)
         else:
-            use_smote = st.checkbox("Use SMOTE (training only)", value=False)
-            if use_smote and not IMBLEARN_OK:
-                st.warning("Install SMOTE dependency: pip install imbalanced-learn")
+            st.info("No cv_results.csv found in ./artifacts.")
 
-        # Determine task
-        if target_choice.startswith("Risk_Type"):
-            target_col = "Risk_Type"
-            task = "classification"
-        elif target_choice.startswith("Risk_Score"):
-            target_col = "Risk_Score"
-            task = "regression"
+    with right:
+        st.markdown("#### CV Results — Objective #2 (Risk_Type)")
+        if risk_type_cv_results_df is not None and not risk_type_cv_results_df.empty:
+            st.dataframe(risk_type_cv_results_df, use_container_width=True)
         else:
-            target_col = "Risk_Level_std"
-            task = "classification"
+            st.info("No risk_type_cv_results.csv found in ./artifacts.")
 
-        default_drop = [c for c in ["Risk_Type", "Risk_Score", "Risk_Level", "Risk_Level_std"] if c in df.columns]
-        feature_cols = st.multiselect(
-            "Input features (X)",
-            options=[c for c in df.columns if c not in default_drop],
-            default=[c for c in df.columns if c not in default_drop]
+    st.divider()
+    st.markdown("#### Optional: Run quick CV inside app (Objective 3)")
+
+    if not enable_train_inside_app:
+        st.caption("Turn ON 'Enable train/CV inside app' in the sidebar to run CV here (slower).")
+    else:
+        st.warning("Make sure your pipeline includes preprocessing (and SMOTE inside folds if used).")
+
+        # NOTE: This is only a template for CV evaluation of an already-built pipeline.
+        st.info(
+            "Template placeholder: to run CV inside the app, you must load/build a full sklearn Pipeline "
+            "(preprocessor + model). This app currently expects you to compute CV offline and save CSVs."
         )
-        if not feature_cols:
-            st.error("Please select at least one feature column.")
-            st.stop()
 
-        # Save config in session for other windows
-        st.session_state["cfg"] = {
-            "target_choice": target_choice,
-            "target_col": target_col,
-            "task": task,
-            "test_size": float(test_size),
-            "random_state": int(random_state),
-            "use_smote": bool(use_smote),
-            "feature_cols": feature_cols,
-        }
+# ----------------------------
+# Tab 7: Predict
+# ----------------------------
+with tabs[6]:
+    st.subheader("Predict")
+    st.markdown(
+        "Use trained artifacts to generate predictions. "
+        "Ensure the uploaded dataset has the same schema used during training."
+    )
 
-        # Reset when config changes
-        sig = (
-            tuple(feature_cols), target_col, float(test_size), int(random_state),
-            bool(use_smote), task
-        )
-        if st.session_state.get("cfg_sig") != sig:
-            st.session_state["cfg_sig"] = sig
-            reset_model_state()
-
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        st.markdown('<div class="small-note" style="margin-top:10px;">', unsafe_allow_html=True)
-        st.write("Next: Go to **Explore** window to show distributions and dataset preview.")
-        st.markdown("</div>", unsafe_allow_html=True)
-
-
-else:
-    # For steps 1..8, ensure we have data and config
-    uploaded_file = st.session_state.get("uploaded_file", None)
-
-    # Re-load dataset each run (cache keeps it fast)
-    # Use same uploader logic: if none uploaded, it loads Microplastic.csv
-    df, _src = load_data(st.session_state.get("last_uploaded", None))
-
-    # If user uploaded during step 0, they might not be here.
-    # Fallback: try to load local file; if not present, ask user to go upload.
-    cfg = st.session_state.get("cfg")
-    if cfg is None:
-        st.warning("Please go to **Upload** window first and set your configuration.")
+    if preprocessor is None:
+        st.error("Missing preprocessor.pkl — required for consistent prediction.")
         st.stop()
 
-    target_col = cfg["target_col"]
-    task = cfg["task"]
-    test_size = cfg["test_size"]
-    random_state = cfg["random_state"]
-    use_smote = cfg["use_smote"]
-    feature_cols = cfg["feature_cols"]
+    pred_mode = st.radio("Prediction mode", ["Batch (whole dataset)", "Single row (form)"], horizontal=True)
 
-    # Prepare data
-    data = df.dropna(subset=[target_col]).copy()
-    X = data[feature_cols].copy()
-    y = data[target_col].copy()
+    # Decide which model to use
+    model_choice = st.selectbox(
+        "Choose prediction target/model",
+        [
+            ("Objective #1: Risk Level", "obj1"),
+            ("Objective #2: Risk_Type", "obj2"),
+        ],
+        format_func=lambda x: x[0]
+    )[1]
 
-    if task == "classification":
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=test_size, random_state=random_state, stratify=y
-        )
-    else:
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=test_size, random_state=random_state
-        )
+    model = model_obj1 if model_choice == "obj1" else model_obj2
+    target_name = target_risk_level if model_choice == "obj1" else target_risk_type
 
-    preprocessor, num_cols, cat_cols = build_preprocessor(X_train)
+    if model is None:
+        st.error("Selected model artifact not found. Please add the model file to ./artifacts.")
+        st.stop()
 
-    # -----------------------------
-    # Window 2: Explore
-    # -----------------------------
-    if step == 1:
-        st.subheader("🔎 Explore Dataset")
+    # Build X raw by dropping target if present
+    drop_cols = [c for c in [target_risk_level, target_risk_type] if c in df.columns]
+    X_raw_all = df.drop(columns=drop_cols, errors="ignore")
 
-        a, b = st.columns([2.2, 1])
-        with a:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.write("Dataset preview:")
-            st.dataframe(df.head(25), use_container_width=True)
-            st.markdown("</div>", unsafe_allow_html=True)
+    if pred_mode == "Batch (whole dataset)":
+        if st.button("Run Batch Prediction"):
+            try:
+                Xp = preprocessor.transform(X_raw_all)
 
-        with b:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.metric("Rows", int(df.shape[0]))
-            st.metric("Columns", int(df.shape[1]))
-            st.metric("Target", target_col)
-            st.metric("Task", task)
-            st.markdown("</div>", unsafe_allow_html=True)
+                # Feature selection (optional)
+                if selected_features and isinstance(selected_features, dict) and "columns" in selected_features:
+                    # This only works if your preprocessor outputs a DataFrame with feature names.
+                    # If it outputs numpy/sparse matrix, feature selection must be embedded in pipeline offline.
+                    st.warning(
+                        "selected_features.json detected, but feature selection should be embedded in the saved pipeline "
+                        "for reliable use with matrix outputs."
+                    )
 
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown("**Target Distribution**")
-            if task == "classification":
-                plot_bar_counts(df[target_col].dropna(), f"{target_col} distribution")
-            else:
-                st.write(df[target_col].describe())
-            st.markdown("</div>", unsafe_allow_html=True)
+                # Predict
+                y_pred = model.predict(Xp)
 
-        with c2:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown("**Polymer Type Distribution**")
-            if "Polymer_Type" in df.columns:
-                plot_bar_counts(df["Polymer_Type"].dropna(), "Polymer_Type distribution (Top 20)")
-            else:
-                st.info("Polymer_Type not found.")
-            st.markdown("</div>", unsafe_allow_html=True)
+                out = df.copy()
+                out[f"pred_{target_name}"] = y_pred
 
-    # -----------------------------
-    # Window 3: Preprocess
-    # -----------------------------
-    elif step == 2:
-        st.subheader("🧼 Preprocess")
+                st.success("Prediction complete ✅")
+                st.dataframe(out.head(50), use_container_width=True)
 
-        left, right = st.columns(2)
-        with left:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown("**Detected Feature Types**")
-            st.write("Numeric:", num_cols)
-            st.write("Categorical:", cat_cols)
-            st.markdown("</div>", unsafe_allow_html=True)
-
-        with right:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown("**Missing Values (Selected Features)**")
-            miss = X.isna().sum().sort_values(ascending=False)
-            mv = miss[miss > 0].to_frame("missing_count")
-            if mv.empty:
-                st.success("No missing values for selected features.")
-            else:
-                st.dataframe(mv, use_container_width=True)
-            st.markdown("</div>", unsafe_allow_html=True)
-
-        st.markdown('<div class="card" style="margin-top:12px;">', unsafe_allow_html=True)
-        st.markdown("**Train/Test Split**")
-        s1, s2, s3 = st.columns(3)
-        s1.metric("Train rows", len(X_train))
-        s2.metric("Test rows", len(X_test))
-        s3.metric("Test size", float(test_size))
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    # -----------------------------
-    # Window 4: Imbalance
-    # -----------------------------
-    elif step == 3:
-        st.subheader("⚖️ Class Imbalance")
-
-        if task != "classification":
-            st.info("Imbalance handling is for classification only.")
-        else:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown("**Class distribution (Training set)**")
-            st.dataframe(y_train.value_counts().to_frame("count"), use_container_width=True)
-            st.markdown("</div>", unsafe_allow_html=True)
-
-            if use_smote:
-                if IMBLEARN_OK:
-                    st.success("✅ SMOTE enabled — applied ONLY inside training pipeline (no leakage).")
-                else:
-                    st.error("SMOTE enabled but missing dependency. Install: pip install imbalanced-learn")
-            else:
-                st.warning("SMOTE is OFF. Logistic Regression still uses class_weight='balanced'.")
-
-    # -----------------------------
-    # Window 5: Train
-    # -----------------------------
-    elif step == 4:
-        st.subheader("🧠 Train Models")
-
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        if task == "classification":
-            models_selected = st.multiselect(
-                "Choose models",
-                ["Logistic Regression", "Random Forest", "Gradient Boosting"],
-                default=["Logistic Regression", "Random Forest", "Gradient Boosting"]
-            )
-        else:
-            models_selected = st.multiselect(
-                "Choose models",
-                ["Ridge Regression", "Random Forest Regressor"],
-                default=["Ridge Regression", "Random Forest Regressor"]
-            )
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        cA, cB = st.columns([1, 1.3])
-        with cA:
-            if st.button("🚀 Train now", type="primary", use_container_width=True):
-                reset_model_state()
-                trained = {}
-
-                for name in models_selected:
-                    if task == "classification":
-                        if name == "Logistic Regression":
-                            model = LogisticRegression(max_iter=2000, class_weight="balanced")
-                        elif name == "Random Forest":
-                            model = RandomForestClassifier(n_estimators=300, random_state=random_state)
-                        else:
-                            model = GradientBoostingClassifier(random_state=random_state)
-
-                        if use_smote and IMBLEARN_OK:
-                            pipe = ImbPipeline(steps=[
-                                ("preprocess", preprocessor),
-                                ("smote", SMOTE(random_state=random_state)),
-                                ("model", model),
-                            ])
-                        else:
-                            pipe = Pipeline(steps=[
-                                ("preprocess", preprocessor),
-                                ("model", model),
-                            ])
-
-                        pipe.fit(X_train, y_train)
-                        trained[name] = pipe
-                    else:
-                        if name == "Ridge Regression":
-                            model = Ridge(random_state=random_state)
-                        else:
-                            model = RandomForestRegressor(n_estimators=400, random_state=random_state)
-
-                        pipe = Pipeline(steps=[
-                            ("preprocess", preprocessor),
-                            ("model", model),
-                        ])
-                        pipe.fit(X_train, y_train)
-                        trained[name] = pipe
-
-                st.session_state["trained_models"] = trained
-                st.success("Training complete! Proceed to Validate window.")
-
-        with cB:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown("**Notes (for defense)**")
-            st.write(
-                "- Preprocessing: imputation → encoding → scaling\n"
-                "- SMOTE (if enabled): training only\n"
-                "- Compare multiple models to select best"
-            )
-            st.markdown("</div>", unsafe_allow_html=True)
-
-    # -----------------------------
-    # Window 6: Validate
-    # -----------------------------
-    elif step == 5:
-        st.subheader("✅ Validate & Compare")
-
-        trained = st.session_state.get("trained_models", {})
-        if not trained:
-            st.warning("Train models first in the Train window.")
-        else:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown("**Model comparison (Test set)**")
-            results = []
-            for name, pipe in trained.items():
-                y_pred = pipe.predict(X_test)
-                if task == "classification":
-                    results.append({"Model": name, **metric_table_classification(y_test, y_pred)})
-                else:
-                    results.append({"Model": name, **metric_table_regression(y_test, y_pred)})
-
-            sort_col = "F1 (Macro)" if task == "classification" else "RMSE"
-            res_df = pd.DataFrame(results).sort_values(by=sort_col, ascending=(task != "classification"))
-            st.dataframe(res_df, use_container_width=True)
-            st.markdown("</div>", unsafe_allow_html=True)
-
-            best_model_name = res_df.iloc[0]["Model"]
-            best_pipe = trained[best_model_name]
-            st.session_state["best_model_name"] = best_model_name
-            st.session_state["best_pipe"] = best_pipe
-
-            st.success(f"Best model: {best_model_name}")
-
-            st.markdown('<div class="card" style="margin-top:12px;">', unsafe_allow_html=True)
-            st.markdown("**Detailed evaluation (Best model)**")
-            best_pred = best_pipe.predict(X_test)
-
-            if task == "classification":
-                labels = sorted(pd.Series(y_test).unique().tolist())
-                plot_conf_mat(y_test, best_pred, labels=labels, title=f"Confusion Matrix: {best_model_name}")
-                st.text(classification_report(y_test, best_pred, zero_division=0))
-            else:
-                st.json(metric_table_regression(y_test, best_pred))
-            st.markdown("</div>", unsafe_allow_html=True)
-
-            if task == "classification":
-                st.markdown('<div class="card" style="margin-top:12px;">', unsafe_allow_html=True)
-                st.markdown("**Cross-validation (5-fold Stratified CV)**")
-                if st.button("Run CV", use_container_width=True):
-                    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
-                    scoring = "f1_macro"
-                    cv_rows = []
-                    for name, pipe in trained.items():
-                        scores = cross_val_score(pipe, X, y, cv=cv, scoring=scoring)
-                        cv_rows.append({
-                            "Model": name,
-                            "CV metric": "F1 (Macro)",
-                            "Mean": float(np.mean(scores)),
-                            "Std": float(np.std(scores)),
-                        })
-                    cv_df = pd.DataFrame(cv_rows).sort_values("Mean", ascending=False)
-                    st.session_state["cv_results"] = cv_df
-                    st.dataframe(cv_df, use_container_width=True)
-                st.markdown("</div>", unsafe_allow_html=True)
-
-    # -----------------------------
-    # Window 7: Explain
-    # -----------------------------
-    elif step == 6:
-        st.subheader("🧩 Explain (Feature Relevance)")
-
-        best_pipe = st.session_state.get("best_pipe")
-        best_name = st.session_state.get("best_model_name")
-        if best_pipe is None:
-            st.warning("Select best model first in Validate window.")
-        else:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown(f"**Best model:** {best_name}")
-            st.caption("Permutation importance = impact on model score when feature is shuffled.")
-
-            if st.button("Compute Feature Importance", type="primary", use_container_width=True):
-                scoring = "f1_macro" if task == "classification" else "r2"
-                perm = permutation_importance(
-                    best_pipe, X_test, y_test, n_repeats=10,
-                    random_state=random_state, scoring=scoring
+                # Download
+                csv = out.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "Download predictions as CSV",
+                    data=csv,
+                    file_name="predictions.csv",
+                    mime="text/csv",
                 )
-                imp = pd.DataFrame({
-                    "Feature": feature_cols,
-                    "Importance (mean)": perm.importances_mean,
-                    "Importance (std)": perm.importances_std
-                }).sort_values("Importance (mean)", ascending=False)
+            except Exception as e:
+                st.error(f"Prediction failed.\n\n{e}")
 
-                st.session_state["feature_importance"] = imp
+    else:
+        st.markdown("Fill in the feature values below (for columns in your dataset).")
 
-            imp = st.session_state.get("feature_importance")
-            if imp is None:
-                st.info("Click compute to show important features.")
-            else:
-                st.dataframe(imp.head(20), use_container_width=True)
+        # Build a form using dataframe columns
+        feature_cols = list(X_raw_all.columns)
 
-                fig, ax = plt.subplots()
-                top = imp.head(12)
-                ax.bar(top["Feature"].astype(str), top["Importance (mean)"].values)
-                ax.set_title("Top Feature Importances (Permutation)")
-                ax.set_ylabel("Importance")
-                plt.xticks(rotation=45, ha="right")
-                st.pyplot(fig)
+        if not feature_cols:
+            st.error("No feature columns found after dropping targets.")
+            st.stop()
 
-            st.markdown("</div>", unsafe_allow_html=True)
+        with st.form("single_row_form"):
+            inputs = {}
+            # Make it manageable: show first N then expand
+            N = min(20, len(feature_cols))
+            c1, c2 = st.columns(2)
+            for i, col in enumerate(feature_cols[:N]):
+                col_series = X_raw_all[col]
+                is_num = pd.api.types.is_numeric_dtype(col_series)
+                container = c1 if i % 2 == 0 else c2
 
-    # -----------------------------
-    # Window 8: Predict
-    # -----------------------------
-    elif step == 7:
-        st.subheader("🔮 Predict (Demo)")
+                with container:
+                    if is_num:
+                        # Use median as default
+                        default = float(np.nanmedian(col_series.values)) if np.isfinite(np.nanmedian(col_series.values)) else 0.0
+                        inputs[col] = st.number_input(col, value=default)
+                    else:
+                        options = [str(x) for x in col_series.dropna().unique()[:200]]
+                        default = options[0] if options else ""
+                        inputs[col] = st.selectbox(col, options=options if options else [""], index=0)
 
-        best_pipe = st.session_state.get("best_pipe")
-        best_name = st.session_state.get("best_model_name")
-        if best_pipe is None:
-            st.warning("Train and validate first.")
-        else:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown(f"**Best model:** {best_name}")
+            with st.expander("More columns (if any)"):
+                for col in feature_cols[N:]:
+                    col_series = X_raw_all[col]
+                    is_num = pd.api.types.is_numeric_dtype(col_series)
+                    if is_num:
+                        default = float(np.nanmedian(col_series.values)) if np.isfinite(np.nanmedian(col_series.values)) else 0.0
+                        inputs[col] = st.number_input(col, value=default)
+                    else:
+                        options = [str(x) for x in col_series.dropna().unique()[:200]]
+                        inputs[col] = st.selectbox(col, options=options if options else [""], index=0)
 
-            with st.form("predict_form"):
-                user_row = {}
-                left, right = st.columns(2)
-                for i, col in enumerate(feature_cols):
-                    box = left if i % 2 == 0 else right
-                    with box:
-                        if col in num_cols:
-                            default_val = float(np.nan_to_num(X[col].median(), nan=0.0))
-                            user_row[col] = st.number_input(col, value=default_val)
-                        else:
-                            options = sorted(X[col].dropna().astype(str).unique().tolist())
-                            user_row[col] = st.selectbox(col, options=options if options else [""])
+            submitted = st.form_submit_button("Predict")
 
-                submitted = st.form_submit_button("Predict", type="primary")
+        if submitted:
+            try:
+                row = pd.DataFrame([inputs])
+                Xp = preprocessor.transform(row)
+                pred = model.predict(Xp)[0]
 
-            if submitted:
-                inp = pd.DataFrame([user_row])
-                pred = best_pipe.predict(inp)[0]
-                st.success(f"Predicted value: **{pred}**")
+                st.success(f"Predicted `{target_name}`: **{pred}**")
 
-            st.markdown("</div>", unsafe_allow_html=True)
+                # If probability exists
+                if hasattr(model, "predict_proba"):
+                    proba = model.predict_proba(Xp)[0]
+                    st.write("Class probabilities:")
+                    st.write(pd.DataFrame({"class": model.classes_, "probability": proba}).sort_values("probability", ascending=False))
+            except Exception as e:
+                st.error(f"Single-row prediction failed.\n\n{e}")
 
-    # -----------------------------
-    # Window 9: Summary
-    # -----------------------------
-    elif step == 8:
-        st.subheader("📌 Summary (For Defense)")
 
-        best_name = st.session_state.get("best_model_name")
-        cv_df = st.session_state.get("cv_results")
-        imp = st.session_state.get("feature_importance")
-
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("**Pipeline demonstrated by this dashboard:**")
-        st.write(
-            "1) Upload Dataset\n"
-            "2) Explore Distributions\n"
-            "3) Preprocess Data\n"
-            "4) Handle Class Imbalance (SMOTE optional)\n"
-            "5) Train Multiple Models\n"
-            "6) Validate & Compare + Cross-Validation\n"
-            "7) Explain via Feature Importance\n"
-            "8) Predict Risk from Inputs"
-        )
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Best Model", best_name if best_name else "N/A")
-        m2.metric("Models Trained", len(st.session_state.get("trained_models", {})))
-        m3.metric("Task", task)
-
-        if cv_df is not None and not cv_df.empty:
-            st.markdown("### Cross-validation Results")
-            st.dataframe(cv_df, use_container_width=True)
-        else:
-            st.info("Run CV in Validate window to show CV results here.")
-
-        if imp is not None:
-            st.markdown("### Top Drivers (Feature Importance)")
-            st.dataframe(imp.head(10), use_container_width=True)
-        else:
-            st.info("Compute feature importance in Explain window.")
-
+# ----------------------------
+# Footer
+# ----------------------------
+st.divider()
+st.caption(
+    "Tip: For best results, train offline and save artifacts to ./artifacts: "
+    "preprocessor.pkl, model.pkl, risk_type_model.pkl, selected_features.json, feature_relevance.csv, cv_results.csv."
+)
