@@ -1,5 +1,6 @@
 # NOTE: This is your full app.py with ONLY the sidebar navigation flow changed
 # All original modeling/visualizations/results are preserved.
+# FIX APPLIED: Robust SMOTE + GridSearchCV so the app won't crash when classes are too small.
 
 import numpy as np
 import pandas as pd
@@ -343,6 +344,12 @@ def smote_and_tune_logreg_pipeline(
     drop_cols_for_model: tuple,
     fast_mode: bool,
 ):
+    """
+    Same functionality & returns as before, but robust:
+    - Adjust SMOTE k_neighbors based on min class size
+    - Reduce CV folds if classes are small
+    - Fallback to tuning without SMOTE if SMOTE tuning fails (prevents app crash)
+    """
     if not IMBLEARN_OK:
         raise RuntimeError("imbalanced-learn is required for SMOTE. Install: pip install imbalanced-learn")
 
@@ -353,31 +360,77 @@ def smote_and_tune_logreg_pipeline(
 
     preprocessor = build_preprocess_pipeline_cached(df_raw, drop_cols_for_model)
 
-    base_pipe = ImbPipeline(steps=[
-        ("prep", preprocessor),
-        ("smote", SMOTE(random_state=42)),
-        ("model", LogisticRegression(max_iter=2000, multi_class="auto", solver="lbfgs")),
-    ])
+    # --- Safe SMOTE params (prevents GridSearchCV all-fits-failed) ---
+    class_counts = y_train.value_counts()
+    min_count = int(class_counts.min())
+
+    if min_count <= 1:
+        use_smote = False
+        k_neighbors = None
+    else:
+        use_smote = True
+        k_neighbors = max(1, min(5, min_count - 1))  # SMOTE needs k+1 samples in minority class
+
+    if use_smote:
+        base_pipe = ImbPipeline(steps=[
+            ("prep", preprocessor),
+            ("smote", SMOTE(random_state=42, k_neighbors=k_neighbors)),
+            ("model", LogisticRegression(max_iter=2000, multi_class="auto", solver="lbfgs")),
+        ])
+    else:
+        base_pipe = Pipeline(steps=[
+            ("prep", preprocessor),
+            ("model", LogisticRegression(max_iter=2000, multi_class="auto", solver="lbfgs")),
+        ])
 
     param_grid = {"model__C": [0.01, 0.1, 1, 10]}
     cv_folds = 3 if fast_mode else 5
+
+    # reduce folds when minority class is very small
+    cv_folds = min(cv_folds, max(2, min_count))  # if min_count=2 => cv=2
 
     grid = GridSearchCV(
         estimator=base_pipe,
         param_grid=param_grid,
         scoring="f1_weighted",
         cv=cv_folds,
-        n_jobs=-1
+        n_jobs=-1,
+        error_score="raise"
     )
 
-    grid.fit(X_train, y_train)
-    best_params = grid.best_params_
+    tuning_note = None
+    try:
+        grid.fit(X_train, y_train)
+        best_pipe = grid.best_estimator_
+        best_params = grid.best_params_
+        tuned_label = "Logistic Regression (Tuned + SMOTE)" if use_smote else "Logistic Regression (Tuned)"
+    except ValueError:
+        # fallback: tune without SMOTE to avoid crashing
+        fallback_pipe = Pipeline(steps=[
+            ("prep", preprocessor),
+            ("model", LogisticRegression(max_iter=2000, multi_class="auto", solver="lbfgs")),
+        ])
+        grid2 = GridSearchCV(
+            estimator=fallback_pipe,
+            param_grid=param_grid,
+            scoring="f1_weighted",
+            cv=min(3 if fast_mode else 5, max(2, min_count)),
+            n_jobs=-1,
+            error_score="raise"
+        )
+        grid2.fit(X_train, y_train)
+        best_pipe = grid2.best_estimator_
+        best_params = grid2.best_params_
+        tuned_label = "Logistic Regression (Tuned)"
+        tuning_note = (
+            "⚠️ SMOTE tuning failed due to very small class counts in CV folds. "
+            "Fell back to tuning Logistic Regression WITHOUT SMOTE."
+        )
 
-    best_pipe = grid.best_estimator_
     y_pred = best_pipe.predict(X_test)
 
     tuned_metrics = pd.DataFrame([{
-        "Model": "Logistic Regression (Tuned + SMOTE)",
+        "Model": tuned_label,
         "Accuracy": accuracy_score(y_test, y_pred),
         "Precision (weighted)": precision_score(y_test, y_pred, average="weighted", zero_division=0),
         "Recall (weighted)": recall_score(y_test, y_pred, average="weighted", zero_division=0),
@@ -389,6 +442,13 @@ def smote_and_tune_logreg_pipeline(
         if used_stratify
         else f"⚠️ Non-stratified split used (test_size={final_test_size:.2f}) because some classes are too small."
     )
+
+    # keep original split note behavior, add extra detail (doesn't change results)
+    split_note += f" CV folds={cv_folds}."
+    if use_smote and tuning_note is None:
+        split_note += f" SMOTE k_neighbors={k_neighbors}."
+    if tuning_note:
+        split_note += " " + tuning_note
 
     split_info = {
         "X_train_shape": X_train.shape,
