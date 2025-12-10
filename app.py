@@ -1,8 +1,8 @@
 # app.py
 # Streamlit Dashboard: Predictive Risk Modeling Framework for Microplastic Pollution
-# Includes:
-# - Robust CSV loader (handles empty uploads, resets pointer, tries separators/encodings)
-# - Defaults aligned to your confirmed columns: Risk_Level, Risk_Score
+# - Robust CSV loader
+# - Defaults aligned to your confirmed columns:
+#   Risk_Level, Risk_Score, Mp_Count, Polymer_Type
 
 from __future__ import annotations
 
@@ -29,14 +29,14 @@ except Exception:
 # ----------------------------
 @dataclass(frozen=True)
 class AppConfig:
-    # ✅ Your confirmed column names
+    # ✅ Confirmed column names
     target_risk_level: str = "Risk_Level"      # Objective #1 target
     risk_score_col: str = "Risk_Score"         # numeric
+    mp_count_col: str = "Mp_Count"             # numeric
+    polymer_type_col: str = "Polymer_Type"     # categorical
 
-    # Optional columns (edit if your CSV uses different names)
+    # Optional (edit if present in your CSV)
     target_risk_type: str = "Risk_Type"        # Objective #2 target
-    mp_count_col: str = "mp count per l"       # numeric
-    polymer_type_col: str = "Polymer Type"     # categorical
 
     # Artifact paths (produced by offline training pipeline)
     artifacts_dir: str = "artifacts"
@@ -215,10 +215,10 @@ with st.sidebar:
     st.header("🧩 Column Settings (edit if needed)")
     target_risk_level = st.text_input("Target (Risk Level) column", CFG.target_risk_level)
     risk_score_col = st.text_input("Risk score column", CFG.risk_score_col)
-
-    target_risk_type = st.text_input("Target (Risk_Type) column", CFG.target_risk_type)
     mp_count_col = st.text_input("MP count column", CFG.mp_count_col)
     polymer_type_col = st.text_input("Polymer type column", CFG.polymer_type_col)
+
+    target_risk_type = st.text_input("Target (Risk_Type) column (optional)", CFG.target_risk_type)
 
     st.divider()
     st.caption("Artifacts folder expected: ./artifacts/")
@@ -238,7 +238,6 @@ except EmptyDataError:
 except Exception as e:
     st.error(f"Failed to load CSV: {e}")
     st.stop()
-
 
 # ----------------------------
 # Artifact Loading
@@ -266,7 +265,6 @@ if show_debug:
         "risk_type_cv_results_df": risk_type_cv_results_df is not None,
     })
 
-
 # ----------------------------
 # Tabs
 # ----------------------------
@@ -278,7 +276,6 @@ tabs = st.tabs([
     "5) Validation / Cross-Validation (Objective 3)",
     "6) Predict",
 ])
-
 
 # ----------------------------
 # Tab 1: Overview
@@ -331,7 +328,7 @@ with tabs[1]:
         if mp_count_col in df.columns and risk_score_col in df.columns:
             make_scatter(df, mp_count_col, risk_score_col, f"{risk_score_col} vs {mp_count_col}")
         else:
-            st.info("Scatter plot needs both risk score and mp count columns (mp count optional).")
+            st.info("Scatter plot needs both risk score and mp count columns.")
 
     with right:
         if risk_score_col in df.columns and target_risk_level in df.columns:
@@ -441,7 +438,7 @@ with tabs[3]:
 # ----------------------------
 with tabs[4]:
     st.subheader("Validation / Cross-Validation (Objective 3)")
-    st.markdown("Best practice: run CV during development and save results as CSV for reporting.")
+    st.markdown("Run CV during development and save results as CSV for reporting.")
 
     left, right = st.columns(2)
     with left:
