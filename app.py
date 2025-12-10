@@ -1,8 +1,3 @@
-# NOTE: Full app.py
-# Changes applied:
-# (1) get_Xy_for_target(): drops NaN/blank target rows before modeling
-# (2) smote_and_tune_logreg_pipeline(): robust SMOTE + CV fold selection + fallback to no-SMOTE tuning
-
 import numpy as np
 import pandas as pd
 
@@ -236,9 +231,6 @@ def build_preprocess_pipeline_cached(df_raw: pd.DataFrame, drop_cols_for_model: 
 
 
 def get_Xy_for_target(df_raw: pd.DataFrame, target_col: str, drop_cols_for_model: tuple):
-    """
-    FIX: drop NaN/blank targets so sklearn models won't crash (e.g., RF importance).
-    """
     df = df_raw.copy()
     df = coerce_numeric_like(df, NUMERIC_COLS)
 
@@ -251,7 +243,7 @@ def get_Xy_for_target(df_raw: pd.DataFrame, target_col: str, drop_cols_for_model
     X = df[feature_cols].copy()
     y = df[target_col].copy()
 
-    # ✅ drop missing/blank targets
+    # FIX: drop missing/blank targets
     y = y.replace({"": np.nan, "nan": np.nan, "None": np.nan})
     mask = y.notna()
     X = X.loc[mask].copy()
@@ -264,7 +256,8 @@ def get_Xy_for_target(df_raw: pd.DataFrame, target_col: str, drop_cols_for_model
 def build_models_fast(fast_mode: bool):
     rf_estimators = 150 if fast_mode else 400
     return {
-        "Logistic Regression": LogisticRegression(max_iter=2000, multi_class="auto", solver="lbfgs"),
+        # FIX: removed multi_class="auto" for sklearn compatibility
+        "Logistic Regression": LogisticRegression(max_iter=2000, solver="lbfgs"),
         "Random Forest": RandomForestClassifier(n_estimators=rf_estimators, random_state=42, n_jobs=-1),
         "Gradient Boosting": GradientBoostingClassifier(random_state=42),
     }
@@ -343,12 +336,6 @@ def smote_and_tune_logreg_pipeline(
     drop_cols_for_model: tuple,
     fast_mode: bool,
 ):
-    """
-    Robust tuning:
-    - safe SMOTE k_neighbors
-    - reduce cv folds when minority class is small
-    - fallback to tuning without SMOTE if SMOTE tuning fails
-    """
     if not IMBLEARN_OK:
         raise RuntimeError("imbalanced-learn is required for SMOTE. Install: pip install imbalanced-learn")
 
@@ -374,12 +361,13 @@ def smote_and_tune_logreg_pipeline(
         base_pipe = ImbPipeline(steps=[
             ("prep", preprocessor),
             ("smote", SMOTE(random_state=42, k_neighbors=k_neighbors)),
-            ("model", LogisticRegression(max_iter=2000, multi_class="auto", solver="lbfgs")),
+            # FIX: removed multi_class="auto"
+            ("model", LogisticRegression(max_iter=2000, solver="lbfgs")),
         ])
     else:
         base_pipe = Pipeline(steps=[
             ("prep", preprocessor),
-            ("model", LogisticRegression(max_iter=2000, multi_class="auto", solver="lbfgs")),
+            ("model", LogisticRegression(max_iter=2000, solver="lbfgs")),
         ])
 
     param_grid = {"model__C": [0.01, 0.1, 1, 10]}
@@ -404,7 +392,7 @@ def smote_and_tune_logreg_pipeline(
     except ValueError:
         fallback_pipe = Pipeline(steps=[
             ("prep", preprocessor),
-            ("model", LogisticRegression(max_iter=2000, multi_class="auto", solver="lbfgs")),
+            ("model", LogisticRegression(max_iter=2000, solver="lbfgs")),
         ])
         grid2 = GridSearchCV(
             estimator=fallback_pipe,
@@ -511,7 +499,6 @@ def run_cv(
         "accuracy": "Accuracy",
         "precision_w": "Precision (weighted)",
         "recall_w": "Recall (weighted)",
-        "recall_w": "Recall (weighted)",
         "f1_w": "F1-score (weighted)",
     })
 
@@ -585,12 +572,7 @@ def plot_box_by_category_readable(
     top = vc.head(top_n).index
     d[category_col] = d[category_col].where(d[category_col].isin(top), other_label)
 
-    order = (
-        d.groupby(category_col)[value_col]
-        .median()
-        .sort_values()
-        .index.tolist()
-    )
+    order = d.groupby(category_col)[value_col].median().sort_values().index.tolist()
 
     fig, ax = plt.subplots(figsize=figsize)
     if horizontal:
@@ -625,7 +607,6 @@ def plot_categorical_topn_bar(
 
     top = counts.head(top_n)
     remainder = counts.iloc[top_n:].sum()
-
     if remainder > 0:
         top = pd.concat([top, pd.Series({other_label: remainder})])
 
@@ -820,7 +801,6 @@ def main():
 
         def rf_importance(target_col: str):
             X, y = get_Xy_for_target(df_raw, target_col, drop_cols_for_model)
-
             if y.nunique() < 2:
                 st.warning(f"Not enough classes in {target_col} after cleaning (need at least 2).")
                 return
@@ -863,7 +843,6 @@ def main():
     # -------------------- PAGE 4 --------------------
     elif page == "Classification Modeling (Tasks 4, 5 & 7)":
         st.header("Classification Modeling (Tasks 4, 5 & 7)")
-
         tab1, tab2 = st.tabs(["Risk_Type", "Risk_Level"])
 
         with tab1:
@@ -875,7 +854,6 @@ def main():
                     _, metrics_rt, split_info_rt, split_note_rt = train_holdout_models_cached(
                         df_raw, TARGET_RISK_TYPE, test_size, drop_cols_for_model, fast_mode, use_smote=False
                     )
-
                 st.dataframe(metrics_rt.round(3))
                 st.pyplot(plot_metrics_bar(metrics_rt, "(Risk-Type)"))
                 st.info(split_note_rt)
@@ -893,7 +871,6 @@ def main():
                     _, metrics_rl, split_info_rl, split_note_rl = train_holdout_models_cached(
                         df_raw, TARGET_RISK_LEVEL, test_size, drop_cols_for_model, fast_mode, use_smote=False
                     )
-
                 st.dataframe(metrics_rl.round(3))
                 st.pyplot(plot_metrics_bar(metrics_rl, "(Risk-Level)"))
                 st.info(split_note_rl)
