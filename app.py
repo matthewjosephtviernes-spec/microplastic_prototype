@@ -201,6 +201,42 @@ def safe_train_test_split(X, y, test_size=0.2, random_state=42):
 
 
 # -------------------------------------------------------
+# SAFE CV PICKER (prevents crash in Model Validation)
+# -------------------------------------------------------
+def pick_safe_cv(y: pd.Series, requested_splits: int, stratified: bool):
+    y = pd.Series(y).dropna()
+    if y.nunique() < 2:
+        raise ValueError("Need at least 2 classes for cross-validation.")
+
+    counts = y.value_counts()
+    min_count = int(counts.min())
+
+    if stratified:
+        safe_splits = min(requested_splits, min_count)
+        if safe_splits < 2:
+            cv = KFold(n_splits=3, shuffle=True, random_state=42)
+            note = "⚠️ StratifiedKFold not possible (classes too small). Using KFold(n_splits=3)."
+            return cv, note
+
+        if safe_splits != requested_splits:
+            cv = StratifiedKFold(n_splits=safe_splits, shuffle=True, random_state=42)
+            note = f"⚠️ Reduced folds from {requested_splits} to {safe_splits} due to small class counts."
+            return cv, note
+
+        cv = StratifiedKFold(n_splits=requested_splits, shuffle=True, random_state=42)
+        return cv, "✅ Using StratifiedKFold."
+    else:
+        n = len(y)
+        safe_splits = min(requested_splits, n)
+        safe_splits = max(2, safe_splits)
+        if safe_splits != requested_splits:
+            cv = KFold(n_splits=safe_splits, shuffle=True, random_state=42)
+            return cv, f"⚠️ Reduced folds from {requested_splits} to {safe_splits} based on sample size."
+        cv = KFold(n_splits=requested_splits, shuffle=True, random_state=42)
+        return cv, "✅ Using KFold."
+
+
+# -------------------------------------------------------
 # LEAKAGE-SAFE PIPELINE BUILDERS (for both holdout + CV)
 # -------------------------------------------------------
 @st.cache_data(show_spinner=False)
@@ -243,7 +279,6 @@ def get_Xy_for_target(df_raw: pd.DataFrame, target_col: str, drop_cols_for_model
     X = df[feature_cols].copy()
     y = df[target_col].copy()
 
-    # FIX: drop missing/blank targets
     y = y.replace({"": np.nan, "nan": np.nan, "None": np.nan})
     mask = y.notna()
     X = X.loc[mask].copy()
@@ -256,7 +291,6 @@ def get_Xy_for_target(df_raw: pd.DataFrame, target_col: str, drop_cols_for_model
 def build_models_fast(fast_mode: bool):
     rf_estimators = 150 if fast_mode else 400
     return {
-        # FIX: removed multi_class="auto" for sklearn compatibility
         "Logistic Regression": LogisticRegression(max_iter=2000, solver="lbfgs"),
         "Random Forest": RandomForestClassifier(n_estimators=rf_estimators, random_state=42, n_jobs=-1),
         "Gradient Boosting": GradientBoostingClassifier(random_state=42),
@@ -286,6 +320,8 @@ def train_holdout_models_cached(
 
     for name, model in models.items():
         if use_smote:
+            if not IMBLEARN_OK:
+                raise RuntimeError("imbalanced-learn is required for SMOTE. Install: pip install imbalanced-learn")
             pipe = ImbPipeline(steps=[
                 ("prep", preprocessor),
                 ("smote", SMOTE(random_state=42)),
@@ -361,7 +397,6 @@ def smote_and_tune_logreg_pipeline(
         base_pipe = ImbPipeline(steps=[
             ("prep", preprocessor),
             ("smote", SMOTE(random_state=42, k_neighbors=k_neighbors)),
-            # FIX: removed multi_class="auto"
             ("model", LogisticRegression(max_iter=2000, solver="lbfgs")),
         ])
     else:
@@ -461,15 +496,15 @@ def run_cv(
         raise ValueError("Unknown model selected.")
     model = models[model_name]
 
-    cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42) if stratified else KFold(
-        n_splits=n_splits, shuffle=True, random_state=42
-    )
+    cv, cv_note = pick_safe_cv(y, n_splits, stratified)
 
     preprocessor = build_preprocess_pipeline_cached(df_raw, drop_cols_for_model)
 
+    if use_smote and not IMBLEARN_OK:
+        use_smote = False
+        cv_note += " ⚠️ SMOTE disabled (imbalanced-learn not installed)."
+
     if use_smote:
-        if not IMBLEARN_OK:
-            raise RuntimeError("imbalanced-learn is required for SMOTE. Install: pip install imbalanced-learn")
         pipe = ImbPipeline(steps=[
             ("prep", preprocessor),
             ("smote", SMOTE(random_state=42)),
@@ -488,12 +523,12 @@ def run_cv(
         "f1_w": "f1_weighted",
     }
 
-    scores = cross_validate(pipe, X, y, cv=cv, scoring=scoring, n_jobs=-1, error_score="raise")
+    scores = cross_validate(pipe, X, y, cv=cv, scoring=scoring, n_jobs=-1, error_score=np.nan)
 
     summary = {}
     for k in scoring.keys():
-        arr = scores[f"test_{k}"]
-        summary[k] = {"mean": float(np.mean(arr)), "std": float(np.std(arr))}
+        arr = scores.get(f"test_{k}", np.array([np.nan]))
+        summary[k] = {"mean": float(np.nanmean(arr)), "std": float(np.nanstd(arr))}
     summary_df = pd.DataFrame(summary).T
     summary_df = summary_df.rename(index={
         "accuracy": "Accuracy",
@@ -502,7 +537,7 @@ def run_cv(
         "f1_w": "F1-score (weighted)",
     })
 
-    return summary_df, scores
+    return summary_df, scores, cv_note
 
 
 # -------------------------------------------------------
@@ -631,9 +666,13 @@ def main():
 
         ✅ Modeling + CV are leakage-safe (Pipeline does preprocessing inside train/CV folds).
         ✅ Numeric coercion prevents SimpleImputer fit errors.
+        ✅ Model Validation is crash-safe (auto-adjust folds / disable SMOTE if missing).
         """
     )
 
+    # =====================================================
+    # Sidebar Navigation
+    # =====================================================
     st.sidebar.header("Navigation")
 
     NAV = {
@@ -807,7 +846,6 @@ def main():
 
             preprocessor = build_preprocess_pipeline_cached(df_raw, drop_cols_for_model)
             rf = RandomForestClassifier(n_estimators=200 if fast_mode else 400, random_state=42, n_jobs=-1)
-
             pipe = Pipeline(steps=[("prep", preprocessor), ("model", rf)])
             pipe.fit(X, y)
 
@@ -946,7 +984,7 @@ def main():
             st.subheader("SMOTE + Hyperparameter Tuning (LogReg)")
             if not IMBLEARN_OK:
                 st.error("imbalanced-learn is required. Install: pip install imbalanced-learn")
-                return
+                st.stop()
 
             with st.spinner("Running GridSearchCV on training split (leakage-safe)."):
                 _, tuned_metrics, best_params, _, split_note_smote = smote_and_tune_logreg_pipeline(
@@ -1001,7 +1039,7 @@ def main():
             if st.button("Run Cross-Validation", type="primary"):
                 with st.spinner("Running CV..."):
                     try:
-                        summary_df, _ = run_cv(
+                        summary_df, _, cv_note = run_cv(
                             df_raw=df_raw,
                             target_col=target,
                             model_name=model_name,
@@ -1011,6 +1049,7 @@ def main():
                             drop_cols_for_model=drop_cols_for_model,
                             fast_mode=fast_mode,
                         )
+                        st.info(cv_note)
                         st.subheader("CV Summary (mean ± std)")
                         st.dataframe(summary_df.round(4))
                     except Exception as e:
