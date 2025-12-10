@@ -8,7 +8,7 @@ import seaborn as sns
 
 from pandas.errors import EmptyDataError, ParserError
 
-from sklearn.model_selection import train_test_split, KFold, StratifiedKFold, cross_validate, GridSearchCV
+from sklearn.model_selection import train_test_split, KFold, StratifiedKFold, GridSearchCV
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
@@ -489,6 +489,13 @@ def run_cv(
     drop_cols_for_model: tuple,
     fast_mode: bool,
 ):
+    """
+    Manual, crash-safe cross validation:
+    - uses pick_safe_cv() to choose cv object
+    - loops over folds manually
+    - skips folds where y_train has < 2 classes
+    - catches exceptions per fold, sets metrics to NaN
+    """
     X, y = get_Xy_for_target(df_raw, target_col, drop_cols_for_model)
 
     models = build_models_fast(fast_mode)
@@ -497,38 +504,65 @@ def run_cv(
     model = models[model_name]
 
     cv, cv_note = pick_safe_cv(y, n_splits, stratified)
-
     preprocessor = build_preprocess_pipeline_cached(df_raw, drop_cols_for_model)
 
     if use_smote and not IMBLEARN_OK:
         use_smote = False
         cv_note += " ⚠️ SMOTE disabled (imbalanced-learn not installed)."
 
-    if use_smote:
-        pipe = ImbPipeline(steps=[
-            ("prep", preprocessor),
-            ("smote", SMOTE(random_state=42)),
-            ("model", model),
-        ])
-    else:
-        pipe = Pipeline(steps=[
-            ("prep", preprocessor),
-            ("model", model),
-        ])
-
-    scoring = {
-        "accuracy": "accuracy",
-        "precision_w": "precision_weighted",
-        "recall_w": "recall_weighted",
-        "f1_w": "f1_weighted",
+    fold_scores = {
+        "accuracy": [],
+        "precision_w": [],
+        "recall_w": [],
+        "f1_w": [],
     }
 
-    scores = cross_validate(pipe, X, y, cv=cv, scoring=scoring, n_jobs=-1, error_score=np.nan)
+    for fold_idx, (train_idx, test_idx) in enumerate(cv.split(X, y), start=1):
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+        if y_train.nunique() < 2:
+            for k in fold_scores.keys():
+                fold_scores[k].append(np.nan)
+            continue
+
+        if use_smote:
+            pipe = ImbPipeline(steps=[
+                ("prep", preprocessor),
+                ("smote", SMOTE(random_state=42)),
+                ("model", model),
+            ])
+        else:
+            pipe = Pipeline(steps=[
+                ("prep", preprocessor),
+                ("model", model),
+            ])
+
+        try:
+            pipe.fit(X_train, y_train)
+            y_pred = pipe.predict(X_test)
+
+            fold_scores["accuracy"].append(accuracy_score(y_test, y_pred))
+            fold_scores["precision_w"].append(
+                precision_score(y_test, y_pred, average="weighted", zero_division=0)
+            )
+            fold_scores["recall_w"].append(
+                recall_score(y_test, y_pred, average="weighted", zero_division=0)
+            )
+            fold_scores["f1_w"].append(
+                f1_score(y_test, y_pred, average="weighted", zero_division=0)
+            )
+        except Exception:
+            for k in fold_scores.keys():
+                fold_scores[k].append(np.nan)
 
     summary = {}
-    for k in scoring.keys():
-        arr = scores.get(f"test_{k}", np.array([np.nan]))
-        summary[k] = {"mean": float(np.nanmean(arr)), "std": float(np.nanstd(arr))}
+    for metric_key in fold_scores:
+        arr = np.array(fold_scores[metric_key], dtype=float)
+        summary[metric_key] = {
+            "mean": float(np.nanmean(arr)),
+            "std": float(np.nanstd(arr)),
+        }
     summary_df = pd.DataFrame(summary).T
     summary_df = summary_df.rename(index={
         "accuracy": "Accuracy",
@@ -537,7 +571,7 @@ def run_cv(
         "f1_w": "F1-score (weighted)",
     })
 
-    return summary_df, scores, cv_note
+    return summary_df, fold_scores, cv_note
 
 
 # -------------------------------------------------------
@@ -664,9 +698,9 @@ def main():
         This app demonstrates the analysis and modeling workflow for predicting **Risk_Type**
         and **Risk_Level** using microplastic and environmental features.
 
-        ✅ Modeling + CV are leakage-safe (Pipeline does preprocessing inside train/CV folds).
-        ✅ Numeric coercion prevents SimpleImputer fit errors.
-        ✅ Model Validation is crash-safe (auto-adjust folds / disable SMOTE if missing).
+        ✅ Modeling + CV are leakage-safe (Pipeline does preprocessing inside train/CV folds).  
+        ✅ Numeric coercion prevents SimpleImputer fit errors.  
+        ✅ Model Validation is crash-safe (manual CV loop, skips bad folds).
         """
     )
 
@@ -920,7 +954,7 @@ def main():
         st.subheader("Overall Notes (Speed)")
         st.markdown(
             f"""
-            - Current modeling drop columns: **{', '.join(drop_cols_for_model) if drop_cols_for_model else 'None'}**
+            - Current modeling drop columns: **{', '.join(drop_cols_for_model) if drop_cols_for_model else 'None'}**  
             - If the page is slow, keep **Drop Location & Author** ON and keep **Fast Mode** ON.
             """
         )
@@ -1009,35 +1043,41 @@ def main():
 
         st.markdown(
             """
-            This page runs leakage-safe cross-validation using a preprocessing Pipeline.
-            - For classification, Stratified K-Fold is recommended.
-            - If enabled, SMOTE is applied inside each fold (correct way).
+            This section validates the **best classification model** using K-Fold Cross Validation.
+
+            - Target variable: **Risk_Type**  
+            - Model: **Random Forest Classifier**  
+            - Preprocessing (imputation, scaling, encoding) is included inside the pipeline, so validation is leakage-safe.
             """
         )
 
-        target = st.selectbox("Select target", [TARGET_RISK_TYPE, TARGET_RISK_LEVEL])
-        model_name = st.selectbox("Select model", ["Logistic Regression", "Random Forest", "Gradient Boosting"])
+        # 🔒 Fix target and model for validation (as per your research design)
+        target = TARGET_RISK_TYPE
+        model_name = "Random Forest"
+
+        st.info(f"Target fixed to **{target}** and model fixed to **{model_name}** for validation.")
+
         n_splits = st.slider("Number of folds (k)", min_value=3, max_value=10, value=5, step=1)
         stratified = st.checkbox("Use Stratified K-Fold (recommended for classification)", value=True)
 
         use_smote = st.checkbox("Use SMOTE (only if classes are imbalanced)", value=False)
-        if use_smote and target == TARGET_RISK_LEVEL:
-            st.info("SMOTE is usually more relevant for Risk_Type, but you can still try it.")
+        if use_smote:
+            st.caption("SMOTE will be applied inside each fold (if available).")
 
         st.divider()
 
         colA, colB = st.columns([1, 2])
         with colA:
-            st.subheader("Target distribution (after rare-class merge)")
+            st.subheader("Risk_Type distribution (after rare-class merge)")
             if target in df_raw.columns:
                 y_preview = merge_rare_classes(df_raw[target].dropna(), min_count=2, other_label="Other")
                 st.write(y_preview.value_counts())
             else:
-                st.warning(f"Column '{target}' not found.")
+                st.warning(f"Column '{target}' not found in the dataset.")
 
         with colB:
             if st.button("Run Cross-Validation", type="primary"):
-                with st.spinner("Running CV..."):
+                with st.spinner("Running CV on Random Forest (Risk_Type)..."):
                     try:
                         summary_df, _, cv_note = run_cv(
                             df_raw=df_raw,
@@ -1052,6 +1092,15 @@ def main():
                         st.info(cv_note)
                         st.subheader("CV Summary (mean ± std)")
                         st.dataframe(summary_df.round(4))
+
+                        st.markdown(
+                            """
+                            **Interpretation hint (for defense):**  
+                            - *Accuracy* shows overall correct predictions across folds.  
+                            - *Precision (weighted)* and *Recall (weighted)* account for class imbalance.  
+                            - *F1-score (weighted)* balances precision and recall and is a good summary metric.  
+                            """
+                        )
                     except Exception as e:
                         st.error(f"CV failed: {e}")
 
