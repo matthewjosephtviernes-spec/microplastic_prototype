@@ -1,13 +1,10 @@
 # app.py
 # Streamlit Dashboard: Predictive Risk Modeling Framework for Microplastic Pollution
-# - Objective 1: EDA + preprocessing (load/apply preprocessor)
-# - Objective 2: modeling + feature relevance (load trained artifacts)
-# - Objective 3: validation (display CV results; optional run-CV if enabled)
+# Fixes: robust CSV loader (handles empty uploads, resets pointer, tries separators/encodings)
 
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List
@@ -16,11 +13,12 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# Optional plotting libs
 import matplotlib.pyplot as plt
 
+from pandas.errors import EmptyDataError, ParserError
+
 # Optional ML libs (only needed if you enable "Train/CV inside app")
-from sklearn.model_selection import StratifiedKFold, cross_validate, train_test_split
+from sklearn.model_selection import StratifiedKFold, cross_validate
 from sklearn.metrics import (
     accuracy_score,
     f1_score,
@@ -73,31 +71,68 @@ st.set_page_config(
 )
 
 st.title("🧪 Predictive Risk Modeling Framework for Microplastic Pollution")
-st.caption(
-    "EDA • Preprocessing • Feature Selection • Modeling • Cross-Validation • Prediction"
-)
+st.caption("EDA • Preprocessing • Feature Selection • Modeling • Cross-Validation • Prediction")
 
 
 # ----------------------------
 # Helpers
 # ----------------------------
-def _safe_read_csv(uploaded_file) -> pd.DataFrame:
-    # Try utf-8, fallback latin1
-    try:
-        return pd.read_csv(uploaded_file)
-    except UnicodeDecodeError:
-        return pd.read_csv(uploaded_file, encoding="latin1")
-
-
 def _artifact(p: str) -> Path:
     return Path(CFG.artifacts_dir) / p
+
+
+def _safe_read_csv(uploaded_file) -> pd.DataFrame:
+    """
+    Robust CSV reader for Streamlit UploadedFile:
+    - guards empty uploads
+    - resets file pointer
+    - tries multiple encodings + separators
+    - falls back to python engine with sep inference
+    """
+    # Guard: empty file (0 bytes)
+    try:
+        raw = uploaded_file.getvalue()
+        if raw is None or len(raw) == 0:
+            raise EmptyDataError("Uploaded file is empty (0 bytes).")
+    except Exception:
+        raw = None  # if getvalue() isn't supported, proceed
+
+    def _rewind():
+        try:
+            uploaded_file.seek(0)
+        except Exception:
+            pass
+
+    encodings = ["utf-8", "utf-8-sig", "latin1"]
+    seps = [",", ";", "\t", "|"]
+
+    last_err: Optional[Exception] = None
+
+    for enc in encodings:
+        for sep in seps:
+            try:
+                _rewind()
+                return pd.read_csv(uploaded_file, encoding=enc, sep=sep)
+            except (EmptyDataError, ParserError, UnicodeDecodeError) as e:
+                last_err = e
+                continue
+
+    # Fallback: python engine attempts to infer delimiter when sep=None
+    try:
+        _rewind()
+        return pd.read_csv(uploaded_file, engine="python", encoding="utf-8", sep=None)
+    except Exception as e:
+        last_err = e
+
+    raise last_err if last_err else EmptyDataError("Unable to read uploaded CSV.")
 
 
 @st.cache_data(show_spinner=False)
 def load_dataset_from_upload(uploaded_file) -> pd.DataFrame:
     df = _safe_read_csv(uploaded_file)
-    # Normalize column names lightly (keep original too)
-    df.columns = [c.strip() for c in df.columns]
+    df.columns = [str(c).strip() for c in df.columns]
+    if df.shape[1] == 0:
+        raise EmptyDataError("Parsed file has no columns. Check delimiter/format.")
     return df
 
 
@@ -179,40 +214,6 @@ def make_scatter(df: pd.DataFrame, x: str, y: str, title: str):
     st.pyplot(fig, clear_figure=True)
 
 
-def metric_card_row(metrics: Dict[str, float]):
-    cols = st.columns(len(metrics))
-    for i, (k, v) in enumerate(metrics.items()):
-        cols[i].metric(k, f"{v:.4f}")
-
-
-def split_features_targets(
-    df: pd.DataFrame,
-    target_col: str,
-    drop_cols: Optional[List[str]] = None,
-) -> Tuple[pd.DataFrame, pd.Series]:
-    drop_cols = drop_cols or []
-    y = df[target_col]
-    X = df.drop(columns=[target_col] + drop_cols, errors="ignore")
-    return X, y
-
-
-def evaluate_classifier_basic(y_true, y_pred, y_proba=None) -> Dict[str, float]:
-    out = {
-        "accuracy": float(accuracy_score(y_true, y_pred)),
-        "f1_weighted": float(f1_score(y_true, y_pred, average="weighted")),
-        "precision_weighted": float(precision_score(y_true, y_pred, average="weighted", zero_division=0)),
-        "recall_weighted": float(recall_score(y_true, y_pred, average="weighted", zero_division=0)),
-    }
-    # For binary only ROC AUC
-    if y_proba is not None:
-        try:
-            if len(np.unique(y_true)) == 2:
-                out["roc_auc"] = float(roc_auc_score(y_true, y_proba))
-        except Exception:
-            pass
-    return out
-
-
 # ----------------------------
 # Sidebar: Data + Settings
 # ----------------------------
@@ -243,7 +244,15 @@ if uploaded is None:
     st.info("Upload your CSV to begin.")
     st.stop()
 
-df = load_dataset_from_upload(uploaded)
+# Friendly error handling for empty/unreadable uploads
+try:
+    df = load_dataset_from_upload(uploaded)
+except EmptyDataError:
+    st.error("Your uploaded file looks empty or unreadable as CSV. Please re-upload a valid CSV export.")
+    st.stop()
+except Exception as e:
+    st.error(f"Failed to load CSV: {e}")
+    st.stop()
 
 # ----------------------------
 # Artifact Loading
@@ -269,7 +278,6 @@ if show_debug:
         "cv_results_df": cv_results_df is not None,
         "risk_type_cv_results_df": risk_type_cv_results_df is not None,
     })
-
 
 # ----------------------------
 # Tabs
@@ -375,14 +383,12 @@ with tabs[1]:
 # ----------------------------
 with tabs[2]:
     st.subheader("Preprocessing")
-    st.markdown(
-        "Recommended: apply the same preprocessing used during training via a saved `preprocessor.pkl`."
-    )
+    st.markdown("Recommended: apply the same preprocessing used during training via saved `preprocessor.pkl`.")
 
     if preprocessor is None:
         st.warning(
             "No `preprocessor.pkl` found in ./artifacts. "
-            "You can still explore EDA, but prediction and consistent transforms require the preprocessor."
+            "EDA works, but prediction and consistent transforms require the preprocessor."
         )
     else:
         st.success("Loaded preprocessor artifact ✅")
@@ -391,12 +397,10 @@ with tabs[2]:
         if preprocessor is None:
             st.info("Upload a preprocessor artifact to see transformed features.")
         else:
-            # Try to build X by dropping known targets if present
             drop_cols = [c for c in [target_risk_level, target_risk_type] if c in df.columns]
             X_raw = df.drop(columns=drop_cols, errors="ignore")
             try:
                 Xp = preprocessor.transform(X_raw)
-                # If it's sparse, convert small preview only
                 if hasattr(Xp, "toarray"):
                     Xp_preview = Xp[:5].toarray()
                 else:
@@ -410,6 +414,7 @@ with tabs[2]:
 # ----------------------------
 with tabs[3]:
     st.subheader("Feature Selection & Feature Relevance")
+
     if selected_features is not None:
         st.success("Loaded selected features ✅")
         st.write(selected_features)
@@ -420,7 +425,6 @@ with tabs[3]:
         st.success("Loaded feature relevance ✅")
         st.dataframe(feature_relevance_df.head(50), use_container_width=True)
 
-        # Expecting columns like: feature, importance
         cols = [c.lower() for c in feature_relevance_df.columns]
         if "feature" in cols and ("importance" in cols or "relevance" in cols):
             fcol = feature_relevance_df.columns[cols.index("feature")]
@@ -444,9 +448,7 @@ with tabs[3]:
 # ----------------------------
 with tabs[4]:
     st.subheader("Modeling Results (Artifacts)")
-    st.markdown(
-        "This section assumes you already trained models offline and saved them in `./artifacts`."
-    )
+    st.markdown("This section assumes you already trained models offline and saved them in `./artifacts`.")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -460,39 +462,14 @@ with tabs[4]:
         if model_obj2 is None:
             st.info("Add `risk_type_model.pkl` to ./artifacts to enable predictions/evaluation.")
 
-    st.divider()
-
-    if enable_train_inside_app:
-        st.warning("Train inside app is ON. This is slower and mainly for demos.")
-        st.markdown("#### Quick train/evaluate (holdout split)")
-        target_choice = st.selectbox("Choose target to train", [target_risk_level, target_risk_type])
-        test_size = st.slider("Test size", 0.1, 0.4, 0.2, 0.05)
-        random_state = st.number_input("Random state", value=42, step=1)
-
-        if st.button("Train & Evaluate (Holdout)"):
-            if target_choice not in df.columns:
-                st.error(f"Target column not found: {target_choice}")
-            elif preprocessor is None:
-                st.error("Need preprocessor.pkl to train inside app consistently.")
-            else:
-                # Basic pipeline assumption: you trained a *full pipeline* offline.
-                # Here we only demonstrate evaluating a loaded model if it supports fit.
-                # For proper in-app training, you'd need a model pipeline builder.
-                st.error(
-                    "In-app training requires you to define model pipelines (preprocess + model). "
-                    "Recommended: train offline and load artifacts."
-                )
-    else:
-        st.info("Tip: keep training/tuning offline; display results here + predictions in the next tab.")
+    st.info("Tip: keep training/tuning offline; display results here + predictions in the Predict tab.")
 
 # ----------------------------
 # Tab 6: Validation / Cross-Validation (Objective 3)
 # ----------------------------
 with tabs[5]:
     st.subheader("Validation / Cross-Validation (Objective 3)")
-    st.markdown(
-        "Best practice: run CV on TRAIN data only during development, then save results as CSV for reporting."
-    )
+    st.markdown("Best practice: run CV during development and save results as CSV for reporting.")
 
     left, right = st.columns(2)
     with left:
@@ -509,29 +486,12 @@ with tabs[5]:
         else:
             st.info("No risk_type_cv_results.csv found in ./artifacts.")
 
-    st.divider()
-    st.markdown("#### Optional: Run quick CV inside app (Objective 3)")
-
-    if not enable_train_inside_app:
-        st.caption("Turn ON 'Enable train/CV inside app' in the sidebar to run CV here (slower).")
-    else:
-        st.warning("Make sure your pipeline includes preprocessing (and SMOTE inside folds if used).")
-
-        # NOTE: This is only a template for CV evaluation of an already-built pipeline.
-        st.info(
-            "Template placeholder: to run CV inside the app, you must load/build a full sklearn Pipeline "
-            "(preprocessor + model). This app currently expects you to compute CV offline and save CSVs."
-        )
-
 # ----------------------------
 # Tab 7: Predict
 # ----------------------------
 with tabs[6]:
     st.subheader("Predict")
-    st.markdown(
-        "Use trained artifacts to generate predictions. "
-        "Ensure the uploaded dataset has the same schema used during training."
-    )
+    st.markdown("Use trained artifacts to generate predictions. Ensure schema matches training data.")
 
     if preprocessor is None:
         st.error("Missing preprocessor.pkl — required for consistent prediction.")
@@ -539,14 +499,10 @@ with tabs[6]:
 
     pred_mode = st.radio("Prediction mode", ["Batch (whole dataset)", "Single row (form)"], horizontal=True)
 
-    # Decide which model to use
     model_choice = st.selectbox(
         "Choose prediction target/model",
-        [
-            ("Objective #1: Risk Level", "obj1"),
-            ("Objective #2: Risk_Type", "obj2"),
-        ],
-        format_func=lambda x: x[0]
+        [("Objective #1: Risk Level", "obj1"), ("Objective #2: Risk_Type", "obj2")],
+        format_func=lambda x: x[0],
     )[1]
 
     model = model_obj1 if model_choice == "obj1" else model_obj2
@@ -556,7 +512,6 @@ with tabs[6]:
         st.error("Selected model artifact not found. Please add the model file to ./artifacts.")
         st.stop()
 
-    # Build X raw by dropping target if present
     drop_cols = [c for c in [target_risk_level, target_risk_type] if c in df.columns]
     X_raw_all = df.drop(columns=drop_cols, errors="ignore")
 
@@ -564,17 +519,6 @@ with tabs[6]:
         if st.button("Run Batch Prediction"):
             try:
                 Xp = preprocessor.transform(X_raw_all)
-
-                # Feature selection (optional)
-                if selected_features and isinstance(selected_features, dict) and "columns" in selected_features:
-                    # This only works if your preprocessor outputs a DataFrame with feature names.
-                    # If it outputs numpy/sparse matrix, feature selection must be embedded in pipeline offline.
-                    st.warning(
-                        "selected_features.json detected, but feature selection should be embedded in the saved pipeline "
-                        "for reliable use with matrix outputs."
-                    )
-
-                # Predict
                 y_pred = model.predict(Xp)
 
                 out = df.copy()
@@ -583,7 +527,6 @@ with tabs[6]:
                 st.success("Prediction complete ✅")
                 st.dataframe(out.head(50), use_container_width=True)
 
-                # Download
                 csv = out.to_csv(index=False).encode("utf-8")
                 st.download_button(
                     "Download predictions as CSV",
@@ -595,20 +538,18 @@ with tabs[6]:
                 st.error(f"Prediction failed.\n\n{e}")
 
     else:
-        st.markdown("Fill in the feature values below (for columns in your dataset).")
+        st.markdown("Fill in the feature values below (based on your uploaded dataset columns).")
 
-        # Build a form using dataframe columns
         feature_cols = list(X_raw_all.columns)
-
         if not feature_cols:
             st.error("No feature columns found after dropping targets.")
             st.stop()
 
         with st.form("single_row_form"):
             inputs = {}
-            # Make it manageable: show first N then expand
             N = min(20, len(feature_cols))
             c1, c2 = st.columns(2)
+
             for i, col in enumerate(feature_cols[:N]):
                 col_series = X_raw_all[col]
                 is_num = pd.api.types.is_numeric_dtype(col_series)
@@ -616,12 +557,11 @@ with tabs[6]:
 
                 with container:
                     if is_num:
-                        # Use median as default
-                        default = float(np.nanmedian(col_series.values)) if np.isfinite(np.nanmedian(col_series.values)) else 0.0
+                        med = np.nanmedian(col_series.values.astype(float)) if col_series.notna().any() else 0.0
+                        default = float(med) if np.isfinite(med) else 0.0
                         inputs[col] = st.number_input(col, value=default)
                     else:
                         options = [str(x) for x in col_series.dropna().unique()[:200]]
-                        default = options[0] if options else ""
                         inputs[col] = st.selectbox(col, options=options if options else [""], index=0)
 
             with st.expander("More columns (if any)"):
@@ -629,7 +569,8 @@ with tabs[6]:
                     col_series = X_raw_all[col]
                     is_num = pd.api.types.is_numeric_dtype(col_series)
                     if is_num:
-                        default = float(np.nanmedian(col_series.values)) if np.isfinite(np.nanmedian(col_series.values)) else 0.0
+                        med = np.nanmedian(col_series.values.astype(float)) if col_series.notna().any() else 0.0
+                        default = float(med) if np.isfinite(med) else 0.0
                         inputs[col] = st.number_input(col, value=default)
                     else:
                         options = [str(x) for x in col_series.dropna().unique()[:200]]
@@ -642,23 +583,20 @@ with tabs[6]:
                 row = pd.DataFrame([inputs])
                 Xp = preprocessor.transform(row)
                 pred = model.predict(Xp)[0]
-
                 st.success(f"Predicted `{target_name}`: **{pred}**")
 
-                # If probability exists
                 if hasattr(model, "predict_proba"):
                     proba = model.predict_proba(Xp)[0]
                     st.write("Class probabilities:")
-                    st.write(pd.DataFrame({"class": model.classes_, "probability": proba}).sort_values("probability", ascending=False))
+                    st.write(
+                        pd.DataFrame({"class": model.classes_, "probability": proba})
+                        .sort_values("probability", ascending=False)
+                    )
             except Exception as e:
                 st.error(f"Single-row prediction failed.\n\n{e}")
 
-
-# ----------------------------
-# Footer
-# ----------------------------
 st.divider()
 st.caption(
-    "Tip: For best results, train offline and save artifacts to ./artifacts: "
-    "preprocessor.pkl, model.pkl, risk_type_model.pkl, selected_features.json, feature_relevance.csv, cv_results.csv."
+    "Place artifacts in ./artifacts: preprocessor.pkl, model.pkl, risk_type_model.pkl, "
+    "selected_features.json, feature_relevance.csv, cv_results.csv, risk_type_cv_results.csv"
 )
