@@ -1,6 +1,7 @@
-# NOTE: This is your full app.py with ONLY the sidebar navigation flow changed
-# All original modeling/visualizations/results are preserved.
-# FIX APPLIED: Robust SMOTE + GridSearchCV so the app won't crash when classes are too small.
+# NOTE: Full app.py
+# Changes applied:
+# (1) get_Xy_for_target(): drops NaN/blank target rows before modeling
+# (2) smote_and_tune_logreg_pipeline(): robust SMOTE + CV fold selection + fallback to no-SMOTE tuning
 
 import numpy as np
 import pandas as pd
@@ -71,15 +72,12 @@ def load_data(uploaded_file=None):
     If uploaded_file is None, tries to read Microplastic.csv beside app.py.
     """
     if uploaded_file is None:
-        # local file fallback
         path = "Microplastic.csv"
-        # try common encodings
         for enc in ["utf-8", "utf-8-sig", "cp1252", "latin1"]:
             try:
                 return pd.read_csv(path, encoding=enc, sep=None, engine="python")
             except UnicodeDecodeError:
                 continue
-        # last attempt (let it raise)
         return pd.read_csv(path, sep=None, engine="python")
     else:
         for enc in ["utf-8", "utf-8-sig", "cp1252", "latin1"]:
@@ -145,9 +143,6 @@ def scale_numeric(df: pd.DataFrame, numeric_cols):
 
 
 def coerce_numeric_like(df: pd.DataFrame, columns):
-    """
-    Prevent SimpleImputer fit errors by forcing numeric columns to numeric.
-    """
     df = df.copy()
     for c in columns:
         if c in df.columns:
@@ -241,32 +236,36 @@ def build_preprocess_pipeline_cached(df_raw: pd.DataFrame, drop_cols_for_model: 
 
 
 def get_Xy_for_target(df_raw: pd.DataFrame, target_col: str, drop_cols_for_model: tuple):
+    """
+    FIX: drop NaN/blank targets so sklearn models won't crash (e.g., RF importance).
+    """
     df = df_raw.copy()
     df = coerce_numeric_like(df, NUMERIC_COLS)
 
     if target_col not in df.columns:
         raise ValueError(f"Target '{target_col}' not found in dataset.")
 
-    # features = all columns except targets
     drop_targets = [TARGET_RISK_TYPE, TARGET_RISK_LEVEL]
     feature_cols = [c for c in df.columns if c not in drop_targets and c not in drop_cols_for_model]
 
     X = df[feature_cols].copy()
     y = df[target_col].copy()
 
-    # merge rare classes to reduce split errors
+    # ✅ drop missing/blank targets
+    y = y.replace({"": np.nan, "nan": np.nan, "None": np.nan})
+    mask = y.notna()
+    X = X.loc[mask].copy()
+    y = y.loc[mask].copy()
+
     y = merge_rare_classes(y, min_count=2, other_label="Other")
     return X, y
 
 
 def build_models_fast(fast_mode: bool):
-    # keep your original model set
     rf_estimators = 150 if fast_mode else 400
     return {
         "Logistic Regression": LogisticRegression(max_iter=2000, multi_class="auto", solver="lbfgs"),
-        "Random Forest": RandomForestClassifier(
-            n_estimators=rf_estimators, random_state=42, n_jobs=-1
-        ),
+        "Random Forest": RandomForestClassifier(n_estimators=rf_estimators, random_state=42, n_jobs=-1),
         "Gradient Boosting": GradientBoostingClassifier(random_state=42),
     }
 
@@ -345,22 +344,22 @@ def smote_and_tune_logreg_pipeline(
     fast_mode: bool,
 ):
     """
-    Same functionality & returns as before, but robust:
-    - Adjust SMOTE k_neighbors based on min class size
-    - Reduce CV folds if classes are small
-    - Fallback to tuning without SMOTE if SMOTE tuning fails (prevents app crash)
+    Robust tuning:
+    - safe SMOTE k_neighbors
+    - reduce cv folds when minority class is small
+    - fallback to tuning without SMOTE if SMOTE tuning fails
     """
     if not IMBLEARN_OK:
         raise RuntimeError("imbalanced-learn is required for SMOTE. Install: pip install imbalanced-learn")
 
     X, y = get_Xy_for_target(df_raw, target_col, drop_cols_for_model)
+
     (X_train, X_test, y_train, y_test), used_stratify, final_test_size = safe_train_test_split(
         X, y, test_size=test_size, random_state=42
     )
 
     preprocessor = build_preprocess_pipeline_cached(df_raw, drop_cols_for_model)
 
-    # --- Safe SMOTE params (prevents GridSearchCV all-fits-failed) ---
     class_counts = y_train.value_counts()
     min_count = int(class_counts.min())
 
@@ -369,7 +368,7 @@ def smote_and_tune_logreg_pipeline(
         k_neighbors = None
     else:
         use_smote = True
-        k_neighbors = max(1, min(5, min_count - 1))  # SMOTE needs k+1 samples in minority class
+        k_neighbors = max(1, min(5, min_count - 1))
 
     if use_smote:
         base_pipe = ImbPipeline(steps=[
@@ -385,9 +384,7 @@ def smote_and_tune_logreg_pipeline(
 
     param_grid = {"model__C": [0.01, 0.1, 1, 10]}
     cv_folds = 3 if fast_mode else 5
-
-    # reduce folds when minority class is very small
-    cv_folds = min(cv_folds, max(2, min_count))  # if min_count=2 => cv=2
+    cv_folds = min(cv_folds, max(2, min_count))
 
     grid = GridSearchCV(
         estimator=base_pipe,
@@ -405,7 +402,6 @@ def smote_and_tune_logreg_pipeline(
         best_params = grid.best_params_
         tuned_label = "Logistic Regression (Tuned + SMOTE)" if use_smote else "Logistic Regression (Tuned)"
     except ValueError:
-        # fallback: tune without SMOTE to avoid crashing
         fallback_pipe = Pipeline(steps=[
             ("prep", preprocessor),
             ("model", LogisticRegression(max_iter=2000, multi_class="auto", solver="lbfgs")),
@@ -442,8 +438,6 @@ def smote_and_tune_logreg_pipeline(
         if used_stratify
         else f"⚠️ Non-stratified split used (test_size={final_test_size:.2f}) because some classes are too small."
     )
-
-    # keep original split note behavior, add extra detail (doesn't change results)
     split_note += f" CV folds={cv_folds}."
     if use_smote and tuning_note is None:
         split_note += f" SMOTE k_neighbors={k_neighbors}."
@@ -516,6 +510,7 @@ def run_cv(
     summary_df = summary_df.rename(index={
         "accuracy": "Accuracy",
         "precision_w": "Precision (weighted)",
+        "recall_w": "Recall (weighted)",
         "recall_w": "Recall (weighted)",
         "f1_w": "F1-score (weighted)",
     })
@@ -658,9 +653,6 @@ def main():
         """
     )
 
-    # =====================================================
-    # ✅ MODIFIED FLOW ONLY: Grouped Sidebar Navigation
-    # =====================================================
     st.sidebar.header("Navigation")
 
     NAV = {
@@ -705,7 +697,6 @@ def main():
         index=pages_in_cat.index(st.session_state["nav_page"])
     )
     st.session_state["nav_page"] = page
-    # =====================================================
 
     st.sidebar.subheader("Performance")
     fast_mode = st.sidebar.toggle("Fast Mode (recommended)", value=True)
@@ -829,6 +820,11 @@ def main():
 
         def rf_importance(target_col: str):
             X, y = get_Xy_for_target(df_raw, target_col, drop_cols_for_model)
+
+            if y.nunique() < 2:
+                st.warning(f"Not enough classes in {target_col} after cleaning (need at least 2).")
+                return
+
             preprocessor = build_preprocess_pipeline_cached(df_raw, drop_cols_for_model)
             rf = RandomForestClassifier(n_estimators=200 if fast_mode else 400, random_state=42, n_jobs=-1)
 
