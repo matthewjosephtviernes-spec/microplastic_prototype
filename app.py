@@ -1,33 +1,22 @@
 # app.py
 # Streamlit Dashboard: Predictive Risk Modeling Framework for Microplastic Pollution
-# Fixes: robust CSV loader (handles empty uploads, resets pointer, tries separators/encodings)
+# Includes:
+# - Robust CSV loader (handles empty uploads, resets pointer, tries separators/encodings)
+# - Defaults aligned to your confirmed columns: Risk_Level, Risk_Score
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Tuple, List
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-
 import matplotlib.pyplot as plt
 
 from pandas.errors import EmptyDataError, ParserError
-
-# Optional ML libs (only needed if you enable "Train/CV inside app")
-from sklearn.model_selection import StratifiedKFold, cross_validate
-from sklearn.metrics import (
-    accuracy_score,
-    f1_score,
-    precision_score,
-    recall_score,
-    roc_auc_score,
-    confusion_matrix,
-    ConfusionMatrixDisplay,
-)
 
 try:
     import joblib  # recommended for sklearn artifacts
@@ -36,18 +25,20 @@ except Exception:
 
 
 # ----------------------------
-# Config (EDIT THESE)
+# Config (EDIT THESE IF NEEDED)
 # ----------------------------
 @dataclass(frozen=True)
 class AppConfig:
-    # Column names in your dataset (EDIT to match your CSV headers)
-    target_risk_level: str = "risk_level"      # classification target (Objective #1)
-    target_risk_type: str = "Risk_Type"        # classification target (Objective #2)
-    risk_score_col: str = "risk_score"         # numeric
-    mp_count_col: str = "mp count per l"       # numeric
-    polymer_type_col: str = "Polymer Type"     # categorical (optional)
+    # ✅ Your confirmed column names
+    target_risk_level: str = "Risk_Level"      # Objective #1 target
+    risk_score_col: str = "Risk_Score"         # numeric
 
-    # Artifact paths (produced by your offline training pipeline)
+    # Optional columns (edit if your CSV uses different names)
+    target_risk_type: str = "Risk_Type"        # Objective #2 target
+    mp_count_col: str = "mp count per l"       # numeric
+    polymer_type_col: str = "Polymer Type"     # categorical
+
+    # Artifact paths (produced by offline training pipeline)
     artifacts_dir: str = "artifacts"
     preprocessor_path: str = "preprocessor.pkl"
     model_path: str = "model.pkl"
@@ -95,7 +86,7 @@ def _safe_read_csv(uploaded_file) -> pd.DataFrame:
         if raw is None or len(raw) == 0:
             raise EmptyDataError("Uploaded file is empty (0 bytes).")
     except Exception:
-        raw = None  # if getvalue() isn't supported, proceed
+        pass
 
     def _rewind():
         try:
@@ -151,7 +142,7 @@ def load_joblib_artifact(path: Path):
 
 
 @st.cache_data(show_spinner=False)
-def load_json(path: Path) -> Optional[dict]:
+def load_json(path: Path):
     if not path.exists():
         return None
     try:
@@ -186,8 +177,7 @@ def make_box_by_group(df: pd.DataFrame, value_col: str, group_col: str, title: s
         st.info("No data available for this plot (after dropping NA).")
         return
 
-    groups = []
-    labels = []
+    groups, labels = [], []
     for g, sub in dd.groupby(group_col):
         groups.append(sub[value_col].values)
         labels.append(str(g))
@@ -224,18 +214,13 @@ with st.sidebar:
     st.divider()
     st.header("🧩 Column Settings (edit if needed)")
     target_risk_level = st.text_input("Target (Risk Level) column", CFG.target_risk_level)
-    target_risk_type = st.text_input("Target (Risk_Type) column", CFG.target_risk_type)
     risk_score_col = st.text_input("Risk score column", CFG.risk_score_col)
+
+    target_risk_type = st.text_input("Target (Risk_Type) column", CFG.target_risk_type)
     mp_count_col = st.text_input("MP count column", CFG.mp_count_col)
     polymer_type_col = st.text_input("Polymer type column", CFG.polymer_type_col)
 
     st.divider()
-    st.header("⚙️ App Mode")
-    enable_train_inside_app = st.toggle(
-        "Enable train/CV inside app (slower)", value=False,
-        help="Recommended OFF. Prefer loading trained artifacts from /artifacts."
-    )
-
     st.caption("Artifacts folder expected: ./artifacts/")
     show_debug = st.toggle("Show debug info", value=False)
 
@@ -244,7 +229,7 @@ if uploaded is None:
     st.info("Upload your CSV to begin.")
     st.stop()
 
-# Friendly error handling for empty/unreadable uploads
+# Friendly error handling
 try:
     df = load_dataset_from_upload(uploaded)
 except EmptyDataError:
@@ -254,12 +239,14 @@ except Exception as e:
     st.error(f"Failed to load CSV: {e}")
     st.stop()
 
+
 # ----------------------------
 # Artifact Loading
 # ----------------------------
 preprocessor = load_joblib_artifact(_artifact(CFG.preprocessor_path))
 model_obj1 = load_joblib_artifact(_artifact(CFG.model_path))
 model_obj2 = load_joblib_artifact(_artifact(CFG.risk_type_model_path))
+
 selected_features = load_json(_artifact(CFG.selected_features_path))
 feature_relevance_df = load_csv_artifact(_artifact(CFG.feature_relevance_path))
 cv_results_df = load_csv_artifact(_artifact(CFG.cv_results_path))
@@ -279,6 +266,7 @@ if show_debug:
         "risk_type_cv_results_df": risk_type_cv_results_df is not None,
     })
 
+
 # ----------------------------
 # Tabs
 # ----------------------------
@@ -287,10 +275,10 @@ tabs = st.tabs([
     "2) EDA (Objective 1)",
     "3) Preprocessing (Objective 1)",
     "4) Feature Selection & Relevance (Objective 2)",
-    "5) Modeling Results (Objective 2)",
-    "6) Validation / Cross-Validation (Objective 3)",
-    "7) Predict",
+    "5) Validation / Cross-Validation (Objective 3)",
+    "6) Predict",
 ])
+
 
 # ----------------------------
 # Tab 1: Overview
@@ -312,6 +300,7 @@ with tabs[0]:
 
     st.markdown("### Targets availability")
     tcols = st.columns(2)
+
     if target_risk_level in df.columns:
         tcols[0].success(f"Found target column (Risk Level): `{target_risk_level}`")
         tcols[0].write(df[target_risk_level].value_counts(dropna=False).head(20))
@@ -322,7 +311,8 @@ with tabs[0]:
         tcols[1].success(f"Found target column (Risk_Type): `{target_risk_type}`")
         tcols[1].write(df[target_risk_type].value_counts(dropna=False).head(20))
     else:
-        tcols[1].warning(f"Missing `{target_risk_type}`")
+        tcols[1].warning(f"Missing `{target_risk_type}` (optional)")
+
 
 # ----------------------------
 # Tab 2: EDA (Objective 1)
@@ -341,7 +331,7 @@ with tabs[1]:
         if mp_count_col in df.columns and risk_score_col in df.columns:
             make_scatter(df, mp_count_col, risk_score_col, f"{risk_score_col} vs {mp_count_col}")
         else:
-            st.info("Scatter plot needs both risk score and mp count columns.")
+            st.info("Scatter plot needs both risk score and mp count columns (mp count optional).")
 
     with right:
         if risk_score_col in df.columns and target_risk_level in df.columns:
@@ -378,6 +368,7 @@ with tabs[1]:
     else:
         st.warning(f"Column not found: `{risk_score_col}`")
 
+
 # ----------------------------
 # Tab 3: Preprocessing (Objective 1)
 # ----------------------------
@@ -408,6 +399,7 @@ with tabs[2]:
                 st.write(pd.DataFrame(Xp_preview))
             except Exception as e:
                 st.error(f"Preprocessing failed. Ensure your uploaded dataset matches training schema.\n\n{e}")
+
 
 # ----------------------------
 # Tab 4: Feature Selection & Relevance (Objective 2)
@@ -443,31 +435,11 @@ with tabs[3]:
     else:
         st.info("No feature_relevance.csv found in ./artifacts (optional).")
 
+
 # ----------------------------
-# Tab 5: Modeling Results (Objective 2)
+# Tab 5: Validation / Cross-Validation (Objective 3)
 # ----------------------------
 with tabs[4]:
-    st.subheader("Modeling Results (Artifacts)")
-    st.markdown("This section assumes you already trained models offline and saved them in `./artifacts`.")
-
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("#### Objective #1 Model (Risk Level)")
-        st.write("Loaded:", bool(model_obj1))
-        if model_obj1 is None:
-            st.info("Add `model.pkl` to ./artifacts to enable predictions/evaluation.")
-    with c2:
-        st.markdown("#### Objective #2 Model (Risk_Type)")
-        st.write("Loaded:", bool(model_obj2))
-        if model_obj2 is None:
-            st.info("Add `risk_type_model.pkl` to ./artifacts to enable predictions/evaluation.")
-
-    st.info("Tip: keep training/tuning offline; display results here + predictions in the Predict tab.")
-
-# ----------------------------
-# Tab 6: Validation / Cross-Validation (Objective 3)
-# ----------------------------
-with tabs[5]:
     st.subheader("Validation / Cross-Validation (Objective 3)")
     st.markdown("Best practice: run CV during development and save results as CSV for reporting.")
 
@@ -486,10 +458,11 @@ with tabs[5]:
         else:
             st.info("No risk_type_cv_results.csv found in ./artifacts.")
 
+
 # ----------------------------
-# Tab 7: Predict
+# Tab 6: Predict
 # ----------------------------
-with tabs[6]:
+with tabs[5]:
     st.subheader("Predict")
     st.markdown("Use trained artifacts to generate predictions. Ensure schema matches training data.")
 
@@ -594,6 +567,7 @@ with tabs[6]:
                     )
             except Exception as e:
                 st.error(f"Single-row prediction failed.\n\n{e}")
+
 
 st.divider()
 st.caption(
