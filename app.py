@@ -298,7 +298,7 @@ def build_models_fast(fast_mode: bool):
     return {
         "Logistic Regression": LogisticRegression(max_iter=2500, multi_class="auto", solver="lbfgs"),
         "Random Forest": RandomForestClassifier(n_estimators=300, random_state=42, n_jobs=-1),
-        "Gradient Boosting": Gradient BoostingClassifier(n_estimators=200, random_state=42),
+        "Gradient Boosting": GradientBoostingClassifier(n_estimators=200, random_state=42),
     }
 
 
@@ -1018,3 +1018,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
