@@ -157,6 +157,22 @@ def scale_numeric(df: pd.DataFrame, cols):
 
 
 # -------------------------------------------------------
+# NUMERIC SANITIZER (prevents SimpleImputer crash)
+# -------------------------------------------------------
+def coerce_numeric_columns(df: pd.DataFrame, numeric_cols: list[str]) -> pd.DataFrame:
+    """
+    Ensures numeric cols are truly numeric (object strings -> float).
+    Handles commas like "1,234" by removing commas first.
+    """
+    df = df.copy()
+    for c in numeric_cols:
+        if c in df.columns:
+            s = df[c].astype(str).str.replace(",", "", regex=False)
+            df[c] = pd.to_numeric(s, errors="coerce")
+    return df
+
+
+# -------------------------------------------------------
 # SPLIT HELPERS
 # -------------------------------------------------------
 def merge_rare_classes(y: pd.Series, min_count: int = 2, other_label: str = "Other"):
@@ -215,7 +231,10 @@ def safe_train_test_split(X, y, test_size=0.2, random_state=42):
 # -------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def build_preprocess_pipeline_cached(df_raw: pd.DataFrame, drop_cols_for_model: tuple):
+    # IMPORTANT: only include numeric cols that have at least one non-null value (median needs data)
     numeric_features = [c for c in NUMERIC_COLS if c in df_raw.columns]
+    numeric_features = [c for c in numeric_features if df_raw[c].notna().any()]
+
     categorical_features = [c for c in CATEGORICAL_COLS if c in df_raw.columns and c not in drop_cols_for_model]
 
     numeric_pipe = Pipeline(steps=[
@@ -239,10 +258,18 @@ def build_preprocess_pipeline_cached(df_raw: pd.DataFrame, drop_cols_for_model: 
 
 
 def get_Xy_for_target(df_raw: pd.DataFrame, target_col: str, drop_cols_for_model: tuple):
+    """
+    Returns raw X (not dummified) and y, with numeric columns coerced to numeric
+    to prevent SimpleImputer failures inside pipelines.
+    """
     if target_col not in df_raw.columns:
         raise ValueError(f"Target column '{target_col}' not found.")
 
     df = df_raw.dropna(subset=[target_col]).copy()
+
+    # ✅ Ensure numeric cols are truly numeric (fixes your crash)
+    df = coerce_numeric_columns(df, NUMERIC_COLS)
+
     y = merge_rare_classes(df[target_col], min_count=2, other_label="Other")
 
     # remove target columns from features
@@ -261,13 +288,17 @@ def build_models_fast(fast_mode: bool):
     if fast_mode:
         return {
             "Logistic Regression": LogisticRegression(max_iter=1500, multi_class="auto", solver="lbfgs"),
-            "Random Forest": RandomForestClassifier(n_estimators=120, max_depth=12, min_samples_leaf=2, n_jobs=-1, random_state=42),
-            "Gradient Boosting": GradientBoostingClassifier(n_estimators=120, learning_rate=0.08, max_depth=3, random_state=42),
+            "Random Forest": RandomForestClassifier(
+                n_estimators=120, max_depth=12, min_samples_leaf=2, n_jobs=-1, random_state=42
+            ),
+            "Gradient Boosting": GradientBoostingClassifier(
+                n_estimators=120, learning_rate=0.08, max_depth=3, random_state=42
+            ),
         }
     return {
         "Logistic Regression": LogisticRegression(max_iter=2500, multi_class="auto", solver="lbfgs"),
         "Random Forest": RandomForestClassifier(n_estimators=300, random_state=42, n_jobs=-1),
-        "Gradient Boosting": GradientBoostingClassifier(n_estimators=200, random_state=42),
+        "Gradient Boosting": Gradient BoostingClassifier(n_estimators=200, random_state=42),
     }
 
 
@@ -360,7 +391,6 @@ def smote_and_tune_logreg_pipeline(
 
     preprocessor = build_preprocess_pipeline_cached(df_raw, drop_cols_for_model)
 
-    # ImbPipeline so SMOTE happens after preprocessing and only inside training folds
     base_pipe = ImbPipeline(steps=[
         ("prep", preprocessor),
         ("smote", SMOTE(random_state=42)),
@@ -400,7 +430,7 @@ def smote_and_tune_logreg_pipeline(
 
     split_info = {
         "X_train_shape": X_train.shape,
-        "X_test_shape": X_test.shape,  # FIXED bug (was X_train.shape in your paste)
+        "X_test_shape": X_test.shape,
         "y_train_counts": y_train.value_counts(),
         "y_test_counts": y_test.value_counts(),
         "used_stratify": used_stratify,
@@ -608,7 +638,8 @@ def main():
         This app demonstrates the analysis and modeling workflow for predicting **Risk_Type**
         and **Risk_Level** using microplastic and environmental features.
 
-        ✅ Modeling + CV are now **leakage-safe** (Pipeline does preprocessing inside train/CV folds).
+        ✅ Modeling + CV are leakage-safe (Pipeline does preprocessing inside train/CV folds).
+        ✅ Fix included: numeric coercion prevents SimpleImputer fit errors.
         """
     )
 
@@ -747,8 +778,6 @@ def main():
 
         tab_rt, tab_rl = st.tabs(["Risk_Type (RF importance)", "Risk_Level (RF importance)"])
 
-        # Use a pipeline for feature relevance too (preprocess then model)
-        # We'll fit RF on full data for interpretability (not for validation).
         def rf_importance(target_col: str):
             X, y = get_Xy_for_target(df_raw, target_col, drop_cols_for_model)
             preprocessor = build_preprocess_pipeline_cached(df_raw, drop_cols_for_model)
@@ -757,7 +786,6 @@ def main():
             pipe = Pipeline(steps=[("prep", preprocessor), ("model", rf)])
             pipe.fit(X, y)
 
-            # Get feature names after one-hot (sklearn >= 1.0)
             try:
                 feat_names = pipe.named_steps["prep"].get_feature_names_out()
             except Exception:
@@ -794,9 +822,7 @@ def main():
             else:
                 st.warning("Risk_Level column not found.")
 
-        st.info(
-            "For thesis writing: mention that feature importance is computed after preprocessing (imputation, scaling, one-hot)."
-        )
+        st.info("Feature importance is computed after preprocessing (imputation, scaling, one-hot).")
 
     # -------------------- PAGE 4 --------------------
     elif page == "Classification Modeling (Tasks 4, 5 & 7)":
@@ -928,9 +954,9 @@ def main():
 
         st.markdown(
             """
-            This page runs **leakage-safe cross-validation** using a preprocessing **Pipeline**.
-            - For classification, **Stratified K-Fold** is recommended (keeps class balance per fold).
-            - If enabled, **SMOTE is applied inside each fold** (correct way).
+            This page runs leakage-safe cross-validation using a preprocessing Pipeline.
+            - For classification, Stratified K-Fold is recommended.
+            - If enabled, SMOTE is applied inside each fold (correct way).
             """
         )
 
