@@ -81,7 +81,7 @@ def load_data(uploaded_file=None, path: str = "Microplastic.csv"):
 
 
 # -------------------------------------------------------
-# EDA PREPROCESS
+# EDA PREPROCESS (optional pages)
 # -------------------------------------------------------
 def handle_missing_values(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -146,7 +146,7 @@ def scale_numeric(df: pd.DataFrame, cols):
 
 
 # -------------------------------------------------------
-# NUMERIC SANITIZER
+# NUMERIC SANITIZER (prevents pipeline errors)
 # -------------------------------------------------------
 def coerce_numeric_columns(df: pd.DataFrame, numeric_cols: list[str]) -> pd.DataFrame:
     df = df.copy()
@@ -158,7 +158,7 @@ def coerce_numeric_columns(df: pd.DataFrame, numeric_cols: list[str]) -> pd.Data
 
 
 # -------------------------------------------------------
-# SPLIT HELPERS
+# SPLIT + CLASS HELPERS
 # -------------------------------------------------------
 def merge_rare_classes(y: pd.Series, min_count: int = 2, other_label: str = "Other"):
     y = pd.Series(y).copy()
@@ -210,9 +210,6 @@ def safe_train_test_split(X, y, test_size=0.2, random_state=42):
     return (X_train, X_test, y_train, y_test), False, float(test_size)
 
 
-# -------------------------------------------------------
-# PIPELINE BUILDERS
-# -------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def build_preprocess_pipeline_cached(df_raw: pd.DataFrame, drop_cols_for_model: tuple):
     numeric_features = [c for c in NUMERIC_COLS if c in df_raw.columns]
@@ -276,234 +273,59 @@ def build_models_fast(fast_mode: bool):
 
 
 # -------------------------------------------------------
-# NEW: safe CV folds calculator (fixes all_fits_failed)
+# ✅ AUTO-SAFE CROSS VALIDATION (the "validation" part)
 # -------------------------------------------------------
-def choose_safe_cv_folds(y_train: pd.Series, desired_folds: int) -> int:
+def auto_safe_n_splits(y: pd.Series, requested: int) -> int:
     """
-    GridSearchCV uses CV folds. For stratified CV, each class must have >= folds samples.
-    So we set folds <= min_class_count.
+    For StratifiedKFold, each class needs >= n_splits samples.
+    So n_splits <= min_class_count.
+    If too small, we lower folds automatically.
     """
-    counts = pd.Series(y_train).value_counts()
-    min_class = int(counts.min()) if len(counts) else 1
-    folds = int(min(desired_folds, max(2, min_class)))  # at least 2
-    # GridSearchCV requires folds >= 2; but if min_class=1 then folds becomes 2 -> still unsafe.
-    # We'll handle min_class < 2 in caller (fallback without CV tuning).
-    return folds
+    counts = pd.Series(y).value_counts()
+    if counts.empty:
+        return 2
+    min_class = int(counts.min())
+    # At least 2 folds; but if min_class < 2, CV isn't meaningful.
+    return int(max(2, min(requested, min_class)))
 
 
 @st.cache_data(show_spinner=False)
-def train_holdout_models_cached(
-    df_raw: pd.DataFrame,
-    target_col: str,
-    test_size: float,
-    drop_cols_for_model: tuple,
-    fast_mode: bool,
-    use_smote: bool = False,
-):
-    X, y = get_Xy_for_target(df_raw, target_col, drop_cols_for_model)
-
-    (X_train, X_test, y_train, y_test), used_stratify, final_test_size = safe_train_test_split(
-        X, y, test_size=test_size, random_state=42
-    )
-
-    preprocessor = build_preprocess_pipeline_cached(df_raw, drop_cols_for_model)
-    models = build_models_fast(fast_mode)
-
-    metrics_list = []
-    fitted_pipes = {}
-
-    for name, model in models.items():
-        if use_smote:
-            pipe = ImbPipeline(steps=[
-                ("prep", preprocessor),
-                ("smote", SMOTE(random_state=42)),
-                ("model", model),
-            ])
-        else:
-            pipe = Pipeline(steps=[
-                ("prep", preprocessor),
-                ("model", model),
-            ])
-
-        pipe.fit(X_train, y_train)
-        y_pred = pipe.predict(X_test)
-
-        fitted_pipes[name] = pipe
-        metrics_list.append({
-            "Model": name,
-            "Accuracy": accuracy_score(y_test, y_pred),
-            "Precision (weighted)": precision_score(y_test, y_pred, average="weighted", zero_division=0),
-            "Recall (weighted)": recall_score(y_test, y_pred, average="weighted", zero_division=0),
-            "F1-score (weighted)": f1_score(y_test, y_pred, average="weighted", zero_division=0),
-        })
-
-    metrics_df = pd.DataFrame(metrics_list).set_index("Model")
-
-    split_note = (
-        f"✅ Stratified split used (test_size={final_test_size:.2f})."
-        if used_stratify
-        else f"⚠️ Non-stratified split used (test_size={final_test_size:.2f}) because some classes are too small."
-    )
-
-    split_info = {
-        "X_train_shape": X_train.shape,
-        "X_test_shape": X_test.shape,
-        "y_train_counts": y_train.value_counts(),
-        "y_test_counts": y_test.value_counts(),
-        "used_stratify": used_stratify,
-        "final_test_size": final_test_size,
-    }
-
-    return fitted_pipes, metrics_df, split_info, split_note
-
-
-# -------------------------------------------------------
-# FIXED: SMOTE + TUNING with fallback (no more all_fits_failed)
-# -------------------------------------------------------
-def smote_and_tune_logreg_pipeline(
-    df_raw: pd.DataFrame,
-    target_col: str,
-    test_size: float,
-    drop_cols_for_model: tuple,
-    fast_mode: bool,
-):
-    """
-    Robust tuning:
-    - Split
-    - Determine safe CV folds based on min class count
-    - If too few samples for CV/SMOTE, fallback to simple fit without GridSearch/SMOTE.
-    """
-    X, y = get_Xy_for_target(df_raw, target_col, drop_cols_for_model)
-    (X_train, X_test, y_train, y_test), used_stratify, final_test_size = safe_train_test_split(
-        X, y, test_size=test_size, random_state=42
-    )
-
-    preprocessor = build_preprocess_pipeline_cached(df_raw, drop_cols_for_model)
-
-    desired_folds = 3 if fast_mode else 5
-    counts = y_train.value_counts()
-    min_class = int(counts.min()) if len(counts) else 1
-    cv_folds = choose_safe_cv_folds(y_train, desired_folds)
-
-    split_note = (
-        f"✅ Stratified split used (test_size={final_test_size:.2f})."
-        if used_stratify
-        else f"⚠️ Non-stratified split used (test_size={final_test_size:.2f}) because some classes are too small."
-    )
-    split_info = {
-        "X_train_shape": X_train.shape,
-        "X_test_shape": X_test.shape,
-        "y_train_counts": y_train.value_counts(),
-        "y_test_counts": y_test.value_counts(),
-        "used_stratify": used_stratify,
-        "final_test_size": final_test_size,
-        "min_class_train": min_class,
-        "cv_folds_used": cv_folds,
-    }
-
-    # If some class has only 1 sample in training, SMOTE and CV tuning are unsafe.
-    if min_class < 2:
-        base_pipe = Pipeline(steps=[
-            ("prep", preprocessor),
-            ("model", LogisticRegression(max_iter=2000, multi_class="auto", solver="lbfgs")),
-        ])
-        base_pipe.fit(X_train, y_train)
-        y_pred = base_pipe.predict(X_test)
-
-        tuned_metrics = pd.DataFrame([{
-            "Model": "LogReg (no tuning; too few samples per class)",
-            "Accuracy": accuracy_score(y_test, y_pred),
-            "Precision (weighted)": precision_score(y_test, y_pred, average="weighted", zero_division=0),
-            "Recall (weighted)": recall_score(y_test, y_pred, average="weighted", zero_division=0),
-            "F1-score (weighted)": f1_score(y_test, y_pred, average="weighted", zero_division=0),
-        }]).set_index("Model")
-
-        best_params = {"note": "Skipped GridSearchCV/SMOTE because min_class_train < 2."}
-        return base_pipe, tuned_metrics, best_params, split_info, split_note
-
-    # Try SMOTE inside pipeline; if it fails, fallback to no SMOTE.
-    use_smote = True
-    try:
-        pipe_for_search = ImbPipeline(steps=[
-            ("prep", preprocessor),
-            ("smote", SMOTE(random_state=42)),
-            ("model", LogisticRegression(max_iter=2000, multi_class="auto", solver="lbfgs")),
-        ])
-        param_grid = {"model__C": [0.01, 0.1, 1, 10]}
-
-        # StratifiedKFold to keep class balance during tuning
-        inner_cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
-
-        grid = GridSearchCV(
-            estimator=pipe_for_search,
-            param_grid=param_grid,
-            scoring="f1_weighted",
-            cv=inner_cv,
-            n_jobs=-1,
-            error_score="raise",
-        )
-        grid.fit(X_train, y_train)
-        best_pipe = grid.best_estimator_
-        best_params = grid.best_params_
-
-    except Exception:
-        use_smote = False
-        pipe_for_search = Pipeline(steps=[
-            ("prep", preprocessor),
-            ("model", LogisticRegression(max_iter=2000, multi_class="auto", solver="lbfgs")),
-        ])
-        param_grid = {"model__C": [0.01, 0.1, 1, 10]}
-        inner_cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
-
-        grid = GridSearchCV(
-            estimator=pipe_for_search,
-            param_grid=param_grid,
-            scoring="f1_weighted",
-            cv=inner_cv,
-            n_jobs=-1,
-            error_score="raise",
-        )
-        grid.fit(X_train, y_train)
-        best_pipe = grid.best_estimator_
-        best_params = grid.best_params_
-        best_params["note"] = "SMOTE failed in folds; tuned without SMOTE."
-
-    y_pred = best_pipe.predict(X_test)
-
-    tuned_metrics = pd.DataFrame([{
-        "Model": "LogReg (tuned + SMOTE)" if use_smote else "LogReg (tuned, no SMOTE)",
-        "Accuracy": accuracy_score(y_test, y_pred),
-        "Precision (weighted)": precision_score(y_test, y_pred, average="weighted", zero_division=0),
-        "Recall (weighted)": recall_score(y_test, y_pred, average="weighted", zero_division=0),
-        "F1-score (weighted)": f1_score(y_test, y_pred, average="weighted", zero_division=0),
-    }]).set_index("Model")
-
-    return best_pipe, tuned_metrics, best_params, split_info, split_note
-
-
-# -------------------------------------------------------
-# CROSS VALIDATION
-# -------------------------------------------------------
-@st.cache_data(show_spinner=False)
-def run_cross_validation_cached(
+def run_cross_validation_auto_cached(
     df_raw: pd.DataFrame,
     target_col: str,
     model_name: str,
-    n_splits: int,
+    requested_splits: int,
     stratified: bool,
     use_smote: bool,
     drop_cols_for_model: tuple,
     fast_mode: bool,
 ):
+    """
+    Leakage-safe CV:
+    - preprocessing inside pipeline
+    - SMOTE inside fold (if enabled)
+    - automatically adjusts k to avoid "all fits failed"
+    """
     X, y = get_Xy_for_target(df_raw, target_col, drop_cols_for_model)
+
+    if y.nunique() < 2:
+        raise ValueError("Target has < 2 classes; cannot run CV.")
+
+    # Auto-adjust folds if stratified
+    final_splits = requested_splits
+    if stratified:
+        final_splits = auto_safe_n_splits(y, requested_splits)
+        # If min class < 2, you can't do stratified CV properly
+        if pd.Series(y).value_counts().min() < 2:
+            raise ValueError("Some class has only 1 sample; add more data or merge classes.")
 
     models = build_models_fast(fast_mode)
     if model_name not in models:
         raise ValueError("Unknown model selected.")
     model = models[model_name]
 
-    cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42) if stratified else KFold(
-        n_splits=n_splits, shuffle=True, random_state=42
+    cv = StratifiedKFold(n_splits=final_splits, shuffle=True, random_state=42) if stratified else KFold(
+        n_splits=final_splits, shuffle=True, random_state=42
     )
 
     preprocessor = build_preprocess_pipeline_cached(df_raw, drop_cols_for_model)
@@ -541,7 +363,14 @@ def run_cross_validation_cached(
         "f1_w": "F1-score (weighted)",
     })
 
-    return summary_df, scores
+    meta = {
+        "requested_splits": int(requested_splits),
+        "final_splits": int(final_splits),
+        "stratified": bool(stratified),
+        "use_smote": bool(use_smote),
+        "class_counts": pd.Series(y).value_counts(),
+    }
+    return summary_df, scores, meta
 
 
 # -------------------------------------------------------
@@ -591,13 +420,7 @@ def plot_metrics_bar(metrics_df, title_suffix=""):
 
 
 def plot_box_by_category_readable(
-    df,
-    value_col,
-    category_col,
-    top_n=8,
-    other_label="Other",
-    figsize=(12, 5),
-    horizontal=True,
+    df, value_col, category_col, top_n=8, other_label="Other", figsize=(12, 5), horizontal=True
 ):
     val = pd.to_numeric(df[value_col], errors="coerce")
     cat = (
@@ -657,17 +480,16 @@ def plot_categorical_topn_bar(series: pd.Series, title: str, top_n: int = 15, ot
 
 
 # -------------------------------------------------------
-# APP
+# APP (simple + cross validation page included)
 # -------------------------------------------------------
 def main():
     st.title("Microplastic Risk Prediction – Streamlit App")
     st.markdown(
         """
-        ✅ Fix applied: GridSearchCV + SMOTE no longer crashes when classes are too small.
-        If dataset has tiny minority classes, the app automatically:
-        - lowers CV folds
-        - or skips SMOTE
-        - or skips tuning (fallback) instead of crashing
+        This app includes a **leakage-safe Cross Validation page** (Objective #3).
+        - Preprocessing happens inside Pipeline (no leakage)
+        - Optional SMOTE happens inside each fold (correct)
+        - k is auto-adjusted so CV won't fail on small classes
         """
     )
 
@@ -675,19 +497,14 @@ def main():
     page = st.sidebar.radio(
         "Go to",
         [
-            "Data Overview & Task 1",
-            "Preprocessing (Task 2)",
-            "Feature Selection & Relevance (Task 3 & 6)",
-            "Classification Modeling (Tasks 4, 5 & 7)",
+            "Data Overview",
             "Polymer Type Distribution",
-            "SMOTE & Hyperparameter Tuning (Risk_Type)",
-            "Cross Validation (K-Fold)",
+            "Cross Validation (Objective #3)",
         ],
     )
 
     st.sidebar.subheader("Performance")
-    fast_mode = st.sidebar.toggle("Fast Mode (recommended)", value=True)
-    test_size = st.sidebar.slider("Test size", min_value=0.1, max_value=0.4, value=0.2, step=0.05)
+    fast_mode = st.sidebar.toggle("Fast Mode", value=True)
 
     st.sidebar.subheader("Model Features")
     drop_location_author = st.sidebar.checkbox(
@@ -717,141 +534,79 @@ def main():
         st.error("❌ No dataset found. Upload a CSV or add 'Microplastic.csv' beside app.py.")
         st.stop()
 
-    if page == "Data Overview & Task 1":
-        st.header("Data Overview & Task 1: Risk_Score Analysis")
+    if page == "Data Overview":
+        st.subheader("Raw Dataset (first 20 rows)")
+        st.dataframe(df_raw.head(20))
+        st.write("Shape:", df_raw.shape)
 
-        tab1, tab2, tab3, tab4 = st.tabs([
-            "Raw Data",
-            "Risk_Score Distribution",
-            "MP_Count vs Risk_Score",
-            "Risk_Score by Risk_Level",
-        ])
+        if "Risk_Score" in df_raw.columns:
+            st.subheader("Risk_Score Distribution")
+            st.pyplot(plot_hist_box(df_raw, "Risk_Score"))
 
-        with tab1:
-            st.subheader("Raw Dataset (first 10 rows)")
-            st.dataframe(df_raw.head(10))
-            st.markdown(f"**Shape:** `{df_raw.shape[0]}` rows × `{df_raw.shape[1]}` columns")
+        if "MP_Count_per_L" in df_raw.columns and "Risk_Score" in df_raw.columns:
+            st.subheader("MP_Count_per_L vs Risk_Score")
+            st.pyplot(plot_scatter(df_raw, "MP_Count_per_L", "Risk_Score"))
 
-        with tab2:
-            if "Risk_Score" in df_raw.columns:
-                st.pyplot(plot_hist_box(df_raw, "Risk_Score"))
-            else:
-                st.info("Column 'Risk_Score' not found in the dataset.")
-
-        with tab3:
-            if "MP_Count_per_L" in df_raw.columns and "Risk_Score" in df_raw.columns:
-                st.pyplot(plot_scatter(df_raw, "MP_Count_per_L", "Risk_Score"))
-            else:
-                st.info("Columns 'MP_Count_per_L' and/or 'Risk_Score' not found.")
-
-        with tab4:
-            if "Risk_Level" in df_raw.columns and "Risk_Score" in df_raw.columns:
-                st.pyplot(plot_box_by_category_readable(df_raw, "Risk_Score", "Risk_Level"))
-            else:
-                st.info("Columns 'Risk_Level' and/or 'Risk_Score' not found.")
-
-    elif page == "Preprocessing (Task 2)":
-        st.header("Task 2: Preprocessing (EDA view)")
-        df_clean = handle_missing_values(df_raw)
-        df_clean = cap_outliers_iqr(df_clean, NUMERIC_COLS)
-        df_clean, skewness, skewed_cols = transform_skewed(df_clean, NUMERIC_COLS)
-        df_clean, _ = scale_numeric(df_clean, NUMERIC_COLS)
-
-        st.subheader("Skewness (Before Transform)")
-        st.write(skewness)
-        if len(skewed_cols) > 0:
-            st.write("Skewed columns transformed (log1p):")
-            st.write(skewed_cols)
-
-    elif page == "Feature Selection & Relevance (Task 3 & 6)":
-        st.header("Tasks 3 & 6: Feature Relevance (Random Forest importance)")
-        target = st.selectbox("Select target", [TARGET_RISK_TYPE, TARGET_RISK_LEVEL])
-
-        def rf_importance(target_col: str):
-            X, y = get_Xy_for_target(df_raw, target_col, drop_cols_for_model)
-            preprocessor = build_preprocess_pipeline_cached(df_raw, drop_cols_for_model)
-            rf = RandomForestClassifier(n_estimators=200 if fast_mode else 400, random_state=42, n_jobs=-1)
-            pipe = Pipeline(steps=[("prep", preprocessor), ("model", rf)])
-            pipe.fit(X, y)
-            feat_names = pipe.named_steps["prep"].get_feature_names_out()
-            return pd.Series(pipe.named_steps["model"].feature_importances_, index=feat_names).sort_values(ascending=False)
-
-        if target in df_raw.columns:
-            imps = rf_importance(target)
-            st.dataframe(imps.head(20))
-            fig = plt.figure(figsize=(10, 6))
-            imps.head(20).sort_values().plot(kind="barh")
-            plt.tight_layout()
-            st.pyplot(fig)
-        else:
-            st.warning(f"Column '{target}' not found.")
-
-    elif page == "Classification Modeling (Tasks 4, 5 & 7)":
-        st.header("Holdout Modeling (Leakage-safe)")
-
-        target = st.selectbox("Select target", [TARGET_RISK_TYPE, TARGET_RISK_LEVEL])
-        if target not in df_raw.columns:
-            st.warning(f"Column '{target}' not found.")
-        else:
-            _, metrics_df, split_info, split_note = train_holdout_models_cached(
-                df_raw, target, test_size, drop_cols_for_model, fast_mode, use_smote=False
-            )
-            st.dataframe(metrics_df.round(3))
-            st.pyplot(plot_metrics_bar(metrics_df, f"({target})"))
-            st.info(split_note)
-            st.write("Train distribution:")
-            st.write(split_info["y_train_counts"])
-            st.write("Test distribution:")
-            st.write(split_info["y_test_counts"])
+        if "Risk_Level" in df_raw.columns and "Risk_Score" in df_raw.columns:
+            st.subheader("Risk_Score by Risk_Level")
+            st.pyplot(plot_box_by_category_readable(df_raw, "Risk_Score", "Risk_Level"))
 
     elif page == "Polymer Type Distribution":
-        st.header("Polymer Type Distribution")
+        st.subheader("Polymer Type Distribution")
         if "Polymer_Type" not in df_raw.columns:
-            st.warning("Column 'Polymer_Type' not found in the dataset.")
+            st.warning("Column 'Polymer_Type' not found.")
         else:
             polymer = df_raw["Polymer_Type"].astype(str).str.strip().replace({"": np.nan, "nan": np.nan, "None": np.nan}).dropna()
-            fig, _ = plot_categorical_topn_bar(polymer, "Distribution of Polymer_Type", top_n=15)
+            top_n = st.slider("Top N", 5, 30, 15)
+            fig, _ = plot_categorical_topn_bar(polymer, "Distribution of Polymer_Type", top_n=top_n)
             st.pyplot(fig)
 
-    elif page == "SMOTE & Hyperparameter Tuning (Risk_Type)":
-        st.header("SMOTE + Hyperparameter Tuning (Robust)")
+    elif page == "Cross Validation (Objective #3)":
+        st.header("Objective #3: Validation (Cross-Validation)")
 
-        if TARGET_RISK_TYPE not in df_raw.columns:
-            st.warning("Risk_Type column not found.")
-        else:
-            with st.spinner("Tuning Logistic Regression..."):
-                best_pipe, tuned_metrics, best_params, split_info, split_note = smote_and_tune_logreg_pipeline(
-                    df_raw, TARGET_RISK_TYPE, test_size, drop_cols_for_model, fast_mode
-                )
-
-            st.info(split_note)
-            st.write("Training class counts:")
-            st.write(split_info["y_train_counts"])
-            st.write("CV folds used:", split_info.get("cv_folds_used"))
-            st.json(best_params)
-            st.dataframe(tuned_metrics.round(3))
-
-    elif page == "Cross Validation (K-Fold)":
-        st.header("Cross Validation (K-Fold / Stratified)")
         target = st.selectbox("Select target", [TARGET_RISK_TYPE, TARGET_RISK_LEVEL])
         model_name = st.selectbox("Select model", ["Logistic Regression", "Random Forest", "Gradient Boosting"])
-        n_splits = st.slider("Number of folds (k)", min_value=3, max_value=10, value=5, step=1)
-        stratified = st.checkbox("Use Stratified K-Fold", value=True)
-        use_smote = st.checkbox("Use SMOTE", value=False)
+
+        requested_splits = st.slider("Requested folds (k)", min_value=3, max_value=10, value=5, step=1)
+        stratified = st.checkbox("Use StratifiedKFold (recommended)", value=True)
+        use_smote = st.checkbox("Use SMOTE inside folds (Risk_Type imbalance)", value=False)
 
         if st.button("Run Cross-Validation", type="primary"):
             try:
-                summary_df, raw_scores = run_cross_validation_cached(
-                    df_raw=df_raw,
-                    target_col=target,
-                    model_name=model_name,
-                    n_splits=n_splits,
-                    stratified=stratified,
-                    use_smote=use_smote,
-                    drop_cols_for_model=drop_cols_for_model,
-                    fast_mode=fast_mode
-                )
-                st.dataframe(summary_df)
+                with st.spinner("Running CV..."):
+                    summary_df, raw_scores, meta = run_cross_validation_auto_cached(
+                        df_raw=df_raw,
+                        target_col=target,
+                        model_name=model_name,
+                        requested_splits=requested_splits,
+                        stratified=stratified,
+                        use_smote=use_smote,
+                        drop_cols_for_model=drop_cols_for_model,
+                        fast_mode=fast_mode,
+                    )
+
+                st.success("CV completed!")
+                st.subheader("Class distribution (after rare-class merge)")
+                st.write(meta["class_counts"])
+
+                if meta["requested_splits"] != meta["final_splits"]:
+                    st.info(f"Requested k={meta['requested_splits']} but used k={meta['final_splits']} (auto-safe for small classes).")
+
+                st.subheader("CV Results (mean ± std)")
+                show = summary_df.copy()
+                show["mean±std"] = show.apply(lambda r: f"{r['mean']:.3f} ± {r['std']:.3f}", axis=1)
+                st.dataframe(show[["mean±std"]])
+
+                with st.expander("Per-fold scores"):
+                    fold_df = pd.DataFrame({
+                        "Accuracy": raw_scores["test_accuracy"],
+                        "Precision (weighted)": raw_scores["test_precision_w"],
+                        "Recall (weighted)": raw_scores["test_recall_w"],
+                        "F1-score (weighted)": raw_scores["test_f1_w"],
+                    })
+                    fold_df.index = [f"Fold {i+1}" for i in range(len(fold_df))]
+                    st.dataframe(fold_df.round(3))
+
             except Exception as e:
                 st.error(f"Cross-validation failed: {e}")
 
